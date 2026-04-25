@@ -1,0 +1,163 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                    String                 @id @default(cuid())
+  email                 String?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  googleAccounts        GoogleAccount[]
+  appSessions           AppSession[]
+  appAuthCodes          AppAuthCode[]
+  taskListSubscriptions TaskListSubscription[]
+  syncCheckpoints       SyncCheckpoint[]
+  notes                 Note[]
+  appliedMutations      AppliedMutation[]
+  eventLogs             EventLog[]
+  projectionJobs        ProjectionJob[]
+  syncLease             UserSyncLease?
+}
+
+model GoogleAccount {
+  id                      String   @id @default(cuid())
+  userId                  String
+  googleSubject           String   @unique
+  email                   String?
+  refreshTokenCiphertext  String
+  refreshTokenIv          String
+  refreshTokenTag         String
+  scope                   String
+  tokenType               String?
+  authStatus              String   @default("connected")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AppSession {
+  id         String   @id @default(cuid())
+  userId      String
+  tokenHash   String   @unique
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AppAuthCode {
+  id          String   @id @default(cuid())
+  userId       String
+  codeHash     String   @unique
+  redirectUri  String
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model TaskListSubscription {
+  id               String   @id @default(cuid())
+  userId            String
+  googleTaskListId  String
+  title             String
+  isSelected        Boolean  @default(true)
+  isDefault         Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, googleTaskListId])
+}
+
+model SyncCheckpoint {
+  id               String   @id @default(cuid())
+  userId            String
+  googleTaskListId  String
+  updatedMinCursor  DateTime?
+  lastSyncedAt      DateTime?
+  consecutiveErrors Int      @default(0)
+  backoffUntil      DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, googleTaskListId])
+}
+
+model Note {
+  id                 String    @id
+  userId             String
+  title              String
+  bodyMarkdown       String
+  bodyPlaintext      String
+  googleTaskListId   String?
+  taskListNameCache  String?
+  googleTaskId       String?
+  remoteEtag         String?
+  dueDate            String?
+  serverVersion      Int       @default(1)
+  serverUpdatedAt    DateTime  @default(now())
+  deletedAt          DateTime?
+  deletionReason     String?
+  pendingProjection  Boolean   @default(false)
+  lastProjectionError String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, deletedAt])
+  @@index([userId, googleTaskListId, googleTaskId])
+}
+
+model AppliedMutation {
+  id         String   @id
+  userId      String
+  noteId      String?
+  type       String
+  payload    Json
+  appliedAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model EventLog {
+  sequence   Int      @id @default(autoincrement())
+  userId       String
+  type       String
+  noteId      String?
+  payload    Json
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sequence])
+}
+
+model ProjectionJob {
+  id          String   @id @default(cuid())
+  userId       String
+  noteId       String
+  operation   String
+  runAfter    DateTime @default(now())
+  attemptCount Int      @default(0)
+  lastError   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, noteId])
+}
+
+model UserSyncLease {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  ownerId   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

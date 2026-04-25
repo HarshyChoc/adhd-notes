@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sticky Note Editor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: transparent;
+        }
+
+        #editor-container {
+            width: 100%;
+            height: 100%;
+            background: transparent;
+        }
+
+        /* KaTeX custom styling */
+        .katex {
+            font-size: 1.1em;
+        }
+
+        .katex-display {
+            margin: 1em 0;
+        }
+
+        /* Titlebar mask - hides content scrolling under titlebar */
+        #titlebar-mask {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 28px;
+            z-index: 9998;
+            pointer-events: none;
+            /* Background colored dynamically by JS to match note */
+        }
+
+        /* Cursor overlay - arrow cursor for traffic lights area only */
+        #cursor-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 80px;
+            height: 28px;
+            z-index: 10000;
+            cursor: default !important;
+            /* Only covers traffic lights, rest of titlebar allows text clicks when scrolled */
+        }
+    </style>
+</head>
+<body>
+    <div id="cursor-overlay"></div>
+    <div id="titlebar-mask"></div>
+    <div id="editor-container"></div>
+    <script src="editor.bundle.js"></script>
+</body>
+</html>
