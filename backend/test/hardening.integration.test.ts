@@ -237,7 +237,7 @@ test("projection generations prevent a stale worker from clearing newer work", a
   assert.equal((await prisma.note.findUniqueOrThrow({ where: { id: noteId } })).pendingProjection, false);
 });
 
-test("database event replay works without an in-process publish", async () => {
+test("database event replay and live polling work without an in-process publish", async () => {
   const { token, userId } = await authenticatedSession();
   const noteId = randomUUID();
   await prisma.eventLog.create({
@@ -250,12 +250,40 @@ test("database event replay works without an in-process publish", async () => {
     signal: controller.signal,
   });
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-cache, no-transform");
+  assert.equal(response.headers.get("x-accel-buffering"), "no");
   const reader = response.body!.getReader();
-  const chunk = await reader.read();
-  const text = new TextDecoder().decode(chunk.value);
+
+  async function readUntil(pattern: RegExp) {
+    let text = "";
+    while (!pattern.test(text)) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("Timed out waiting for an SSE event.")), 4_000);
+        }),
+      ]);
+      if (chunk.done) throw new Error("The SSE stream closed before the expected event.");
+      text += new TextDecoder().decode(chunk.value);
+    }
+    return text;
+  }
+
+  const replayText = await readUntil(new RegExp(noteId));
+  assert.match(replayText, /event: note\.delete/);
+
+  const liveNoteId = randomUUID();
+  await prisma.eventLog.create({
+    data: {
+      userId,
+      noteId: liveNoteId,
+      type: "note.delete",
+      payload: { noteId: liveNoteId, deletionReason: "test", serverVersion: 4, serverUpdatedAt: new Date() },
+    },
+  });
+  const liveText = await readUntil(new RegExp(liveNoteId));
   controller.abort();
-  assert.match(text, /event: note\.delete/);
-  assert.match(text, new RegExp(noteId));
+  assert.match(liveText, /event: note\.delete/);
 });
 
 test("sync leases exclude peers, renew ownership, and allow takeover after expiry", async () => {
