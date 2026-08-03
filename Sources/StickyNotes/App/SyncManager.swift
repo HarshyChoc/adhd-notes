@@ -568,6 +568,8 @@ final class SyncManager: ObservableObject {
                         bufferedData = ""
                     }
                 }
+                guard !Task.isCancelled else { return }
+                throw URLError(.networkConnectionLost)
             } catch {
                 guard !Task.isCancelled else { return }
                 self.syncErrorMessage = "Live stream disconnected: \(error.localizedDescription)"
