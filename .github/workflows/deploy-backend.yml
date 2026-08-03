@@ -69,6 +69,13 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor-web/package-lock.json
+      - run: npm ci
+        working-directory: editor-web
       - run: swift test
       - run: SKIP_DMG=1 SKIP_ZIP=1 ./build-app.sh
 
