@@ -543,6 +543,11 @@ final class SyncManager: ObservableObject {
                     let httpResponse = response as? HTTPURLResponse,
                     (200..<300).contains(httpResponse.statusCode)
                 else {
+                    if let httpResponse = response as? HTTPURLResponse,
+                       httpResponse.statusCode == 401 {
+                        self.invalidateExpiredSession()
+                        return
+                    }
                     throw URLError(.badServerResponse)
                 }
 
@@ -635,12 +640,27 @@ final class SyncManager: ObservableObject {
             throw URLError(.badServerResponse)
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
+            if authorized, httpResponse.statusCode == 401 {
+                invalidateExpiredSession()
+                throw NSError(domain: "SyncManager", code: 401, userInfo: [
+                    NSLocalizedDescriptionKey: "Session expired. Sign in again."
+                ])
+            }
             let message = String(data: data, encoding: .utf8) ?? "Unknown backend error."
             throw NSError(domain: "SyncManager", code: httpResponse.statusCode, userInfo: [
                 NSLocalizedDescriptionKey: message
             ])
         }
         return try decoder.decode(Response.self, from: data)
+    }
+
+    private func invalidateExpiredSession() {
+        eventStreamTask?.cancel()
+        pendingFlushTask?.cancel()
+        sessionKeychain.deleteValue()
+        sessionToken = nil
+        isAuthenticated = false
+        syncErrorMessage = "Session expired. Sign in again."
     }
 
     private func mutationPayloadObject(from payloadJSON: String) throws -> [String: String?] {
