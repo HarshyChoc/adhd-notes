@@ -30,8 +30,8 @@ final class AppCoordinator: ObservableObject {
 
         SharedWebViewManager.shared.coordinator = self
 
-        syncManager.onRemoteNoteApplied = { [weak self] note in
-            self?.reloadActiveEditorIfNeeded(note)
+        syncManager.onRemoteNoteApplied = { note in
+            SharedWebViewManager.shared.applyRemoteContent(note)
         }
         syncManager.onRemoteNoteDeleted = { noteId in
             if SharedWebViewManager.shared.activeNoteId == noteId {
@@ -81,10 +81,17 @@ final class AppCoordinator: ObservableObject {
     }
 
     func handleContentChange(noteId: UUID, content: String) {
-        noteManager.updateNoteContent(noteId, content: content)
+        guard noteManager.updateNoteContent(noteId, content: content) else {
+            syncManager.noteEditorPersistenceFailed(noteId)
+            return
+        }
         if let note = noteManager.getNote(noteId) {
             syncManager.noteContentChanged(note)
         }
+    }
+
+    func handleEditorChangeStarted(noteId: UUID) {
+        syncManager.noteEditorWillChange(noteId)
     }
 
     func handleWindowStateChange(
@@ -276,8 +283,4 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func reloadActiveEditorIfNeeded(_ note: Note) {
-        guard SharedWebViewManager.shared.activeNoteId == note.id else { return }
-        SharedWebViewManager.shared.switchToNoteSkippingSerialization(note.id, note: note)
-    }
 }

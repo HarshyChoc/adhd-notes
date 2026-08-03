@@ -7,6 +7,7 @@ final class SharedEditorBridge: NSObject, WKScriptMessageHandler {
 
     private enum EditorAction: Sendable {
         case ready
+        case localEditStarted(noteId: UUID?)
         case contentChanged(content: String, noteId: UUID?)
         case requestSave
         case openURL(URL)
@@ -48,6 +49,10 @@ final class SharedEditorBridge: NSObject, WKScriptMessageHandler {
             let noteId = (body["noteId"] as? String).flatMap(UUID.init(uuidString:))
             return .contentChanged(content: content, noteId: noteId)
 
+        case "localEditStarted":
+            let noteId = (body["noteId"] as? String).flatMap(UUID.init(uuidString:))
+            return .localEditStarted(noteId: noteId)
+
         case "requestSave":
             return .requestSave
 
@@ -78,6 +83,10 @@ final class SharedEditorBridge: NSObject, WKScriptMessageHandler {
             // markReady() handles loading any queued note internally
             manager.markReady()
 
+        case let .localEditStarted(messageNoteId):
+            guard let noteId = messageNoteId ?? manager.activeNoteId else { return }
+            manager.coordinator?.handleEditorChangeStarted(noteId: noteId)
+
         case let .contentChanged(content, messageNoteId):
             // Route to the correct note via noteId
             let noteId: UUID
@@ -91,10 +100,7 @@ final class SharedEditorBridge: NSObject, WKScriptMessageHandler {
             manager.coordinator?.handleContentChange(noteId: noteId, content: content)
 
         case .requestSave:
-            if let noteId = manager.activeNoteId,
-               let note = manager.coordinator?.noteManager.getNote(noteId) {
-                manager.coordinator?.noteManager.saveNoteImmediately(note)
-            }
+            manager.flushCurrentNoteState()
 
         case let .openURL(url):
             NSWorkspace.shared.open(url)

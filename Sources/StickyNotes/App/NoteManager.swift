@@ -60,11 +60,12 @@ final class NoteManager: ObservableObject {
         persistenceManager.saveNote(updatedNote)
     }
 
-    func updateNoteContent(_ noteId: UUID, content: String) {
-        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
+    @discardableResult
+    func updateNoteContent(_ noteId: UUID, content: String) -> Bool {
+        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return false }
         notes[index].content = content
         notes[index].updateModificationDate()
-        persistenceManager.saveNote(notes[index])
+        return persistenceManager.saveNote(notes[index])
     }
 
     func updateNoteWindow(

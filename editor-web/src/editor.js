@@ -1371,10 +1371,16 @@ function initEditor(initialContent = '') {
       editorTheme,
       EditorView.updateListener.of((update) => {
         if (update.docChanged && !suppressContentChange) {
+          const editedNoteId = currentNoteId;
+          const content = update.state.doc.toString();
+          // Fence the edit in Swift immediately. The full document remains debounced,
+          // but bootstrap/SSE/ack content cannot replace these not-yet-persisted keys.
+          sendToBridge('localEditStarted', { noteId: editedNoteId });
           clearTimeout(debounceTimer);
           debounceTimer = setTimeout(() => {
             sendToBridge('contentChanged', {
-              content: update.state.doc.toString(),
+              noteId: editedNoteId,
+              content,
             });
           }, 300);
         }

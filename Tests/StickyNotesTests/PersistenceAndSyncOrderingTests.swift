@@ -89,6 +89,37 @@ final class PersistenceAndSyncOrderingTests: XCTestCase {
         XCTAssertEqual(Set(manager.loadQueuedMutations().map(\.id)), ["first", "second"])
     }
 
+    func testUnpersistedEditorTextDefersRemoteContentUntilOutboxTakesOver() {
+        let noteID = UUID()
+        var fence = LocalEditFence()
+
+        fence.begin(noteId: noteID)
+        XCTAssertTrue(fence.shouldDeferRemoteChange(
+            noteId: noteID.uuidString.lowercased(),
+            hasQueuedMutation: false
+        ))
+
+        fence.markDurable(noteId: noteID)
+        XCTAssertTrue(fence.shouldDeferRemoteChange(
+            noteId: noteID.uuidString,
+            hasQueuedMutation: true
+        ))
+        XCTAssertFalse(fence.shouldDeferRemoteChange(
+            noteId: noteID.uuidString,
+            hasQueuedMutation: false
+        ))
+    }
+
+    func testRemoteContentInvalidatesStaleEditorSnapshot() {
+        let noteID = UUID()
+        var cache = EditorStateCache()
+        cache[noteID] = #"{"doc":"stale text","anchor":10,"head":10,"scrollTop":0}"#
+
+        cache.discardForRemoteUpdate(noteId: noteID)
+
+        XCTAssertNil(cache[noteID])
+    }
+
     @MainActor
     func testServerVersionsNeverMoveBackwardAndSyncedNotesCannotDetach() throws {
         let databaseURL = try makeTemporaryDirectory().appendingPathComponent("versions.sqlite")

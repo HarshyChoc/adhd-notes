@@ -27,6 +27,7 @@ final class SyncManager: ObservableObject {
     private var eventStreamGeneration = UUID()
     private var pendingFlushTask: Task<Void, Never>?
     private var sessionToken: String?
+    private var localEditFence = LocalEditFence()
 
     init(persistenceManager: PersistenceManager, noteManager: NoteManager) {
         self.persistenceManager = persistenceManager
@@ -109,6 +110,7 @@ final class SyncManager: ObservableObject {
     func signOut() {
         stopEventStream()
         pendingFlushTask?.cancel()
+        localEditFence.removeAll()
         let preservedCustomBackendBaseURL = syncSessionState.customBackendBaseURL
         let preservedUseCustomBackendBaseURL = syncSessionState.useCustomBackendBaseURL
         sessionKeychain.deleteValue()
@@ -181,12 +183,30 @@ final class SyncManager: ObservableObject {
         queueUpsertMutation(for: refreshed)
     }
 
+    func noteEditorWillChange(_ noteId: UUID) {
+        localEditFence.begin(noteId: noteId)
+    }
+
+    func noteEditorPersistenceFailed(_ noteId: UUID) {
+        // Deliberately retain the fence. Replacing the editor with server content after a
+        // local persistence failure would turn a visible error into silent data loss.
+        syncErrorMessage = persistenceManager.errorMessage
+            ?? "The latest editor change could not be saved locally."
+    }
+
     func noteContentChanged(_ note: Note) {
-        guard isAuthenticated else { return }
-        queueUpsertMutation(for: note)
+        guard isAuthenticated else {
+            localEditFence.markDurable(noteId: note.id)
+            return
+        }
+        if queueUpsertMutation(for: note) {
+            // The durable outbox now protects this content from bootstrap/SSE updates.
+            localEditFence.markDurable(noteId: note.id)
+        }
     }
 
     func noteDeleted(_ note: Note) {
+        localEditFence.remove(noteId: note.id)
         guard isAuthenticated else { return }
         if note.serverVersion == 0 {
             if !persistenceManager.deleteQueuedMutations(noteId: note.id.uuidString.lowercased()) {
@@ -212,8 +232,9 @@ final class SyncManager: ObservableObject {
         queueUpsertMutation(for: note)
     }
 
-    private func queueUpsertMutation(for note: Note) {
-        guard let taskListId = note.taskListId ?? defaultTaskList()?.id else { return }
+    @discardableResult
+    private func queueUpsertMutation(for note: Note) -> Bool {
+        guard let taskListId = note.taskListId ?? defaultTaskList()?.id else { return false }
         let taskListName = note.taskListNameCache ?? defaultTaskList()?.title
         let refreshed = noteManager.updateNoteTaskList(
             note.id,
@@ -221,7 +242,7 @@ final class SyncManager: ObservableObject {
             taskListNameCache: taskListName
         ) ?? note
 
-        queueMutation(
+        return queueMutation(
             type: .upsertNote,
             note: refreshed,
             coalesceKey: "note:\(refreshed.id.uuidString.lowercased())",
@@ -234,17 +255,19 @@ final class SyncManager: ObservableObject {
         )
     }
 
+    @discardableResult
     private func queueMutation<T: Encodable>(
         type: SyncMutationType,
         note: Note,
         coalesceKey: String,
         payload: T
-    ) {
+    ) -> Bool {
         guard
             let data = try? encoder.encode(payload),
             let payloadJSON = String(data: data, encoding: .utf8)
         else {
-            return
+            syncErrorMessage = "The pending note snapshot could not be encoded."
+            return false
         }
 
         let mutation = QueuedMutation(
@@ -260,10 +283,11 @@ final class SyncManager: ObservableObject {
         guard persistenceManager.saveQueuedMutation(mutation) else {
             syncErrorMessage = persistenceManager.errorMessage ?? "The pending change could not be saved locally."
             noteManager.updateNoteSyncState(note.id, syncState: .error, errorMessage: syncErrorMessage)
-            return
+            return false
         }
         noteManager.updateNoteSyncState(note.id, syncState: .pending)
         scheduleOutboxFlush()
+        return true
     }
 
     private func scheduleOutboxFlush() {
@@ -327,16 +351,19 @@ final class SyncManager: ObservableObject {
                         noteId: requested.noteId,
                         excludingIDs: [result.id]
                     )
-                    if hasNewerLocalChange {
-                        guard persistenceManager.rebaseQueuedMutations(
-                            noteId: requested.noteId,
-                            baseServerVersion: note.serverVersion
-                        ) else {
-                            throw NSError(
-                                domain: "SyncManager",
-                                code: 2,
-                                userInfo: [NSLocalizedDescriptionKey: "A newer pending edit could not be rebased locally."]
-                            )
+                    let hasUnpersistedEditorChange = localEditFence.contains(noteId: requested.noteId)
+                    if hasNewerLocalChange || hasUnpersistedEditorChange {
+                        if hasNewerLocalChange {
+                            guard persistenceManager.rebaseQueuedMutations(
+                                noteId: requested.noteId,
+                                baseServerVersion: note.serverVersion
+                            ) else {
+                                throw NSError(
+                                    domain: "SyncManager",
+                                    code: 2,
+                                    userInfo: [NSLocalizedDescriptionKey: "A newer pending edit could not be rebased locally."]
+                                )
+                            }
                         }
                         noteManager.acknowledgeServerVersion(
                             noteIdString: requested.noteId,
@@ -344,8 +371,8 @@ final class SyncManager: ObservableObject {
                             serverUpdatedAt: note.serverUpdatedAt,
                             stillPending: true
                         )
-                    } else if let applied = noteManager.applyServerNote(note) {
-                        onRemoteNoteApplied?(applied)
+                    } else {
+                        applyServerNoteAndNotifyIfContentChanged(note)
                     }
                 }
 
@@ -461,12 +488,12 @@ final class SyncManager: ObservableObject {
 
         if let tombstones = bootstrap.tombstones {
             for tombstone in tombstones
-            where !persistenceManager.hasQueuedMutation(noteId: tombstone.noteId) {
+            where !shouldDeferRemoteChange(noteId: tombstone.noteId) {
                 noteManager.applyServerDeletion(tombstone)
             }
         } else {
             for noteIdString in bootstrap.deletedNoteIds ?? []
-            where !persistenceManager.hasQueuedMutation(noteId: noteIdString) {
+            where !shouldDeferRemoteChange(noteId: noteIdString) {
                 noteManager.applyServerDeletion(
                     noteIdString: noteIdString,
                     reason: "bootstrap_reconciliation"
@@ -475,10 +502,8 @@ final class SyncManager: ObservableObject {
         }
 
         for note in bootstrap.notes
-        where !persistenceManager.hasQueuedMutation(noteId: note.id) {
-            if let applied = noteManager.applyServerNote(note) {
-                onRemoteNoteApplied?(applied)
-            }
+        where !shouldDeferRemoteChange(noteId: note.id) {
+            applyServerNoteAndNotifyIfContentChanged(note)
         }
     }
 
@@ -619,12 +644,10 @@ final class SyncManager: ObservableObject {
 
         switch (eventName ?? envelope.type, envelope.payload) {
         case ("note.upsert", .noteUpsert(let payload)):
-            guard !persistenceManager.hasQueuedMutation(noteId: payload.note.id) else { return }
-            if let note = noteManager.applyServerNote(payload.note) {
-                onRemoteNoteApplied?(note)
-            }
+            guard !shouldDeferRemoteChange(noteId: payload.note.id) else { return }
+            applyServerNoteAndNotifyIfContentChanged(payload.note)
         case ("note.delete", .noteDelete(let payload)):
-            guard !persistenceManager.hasQueuedMutation(noteId: payload.noteId) else { return }
+            guard !shouldDeferRemoteChange(noteId: payload.noteId) else { return }
             noteManager.applyServerDeletion(payload)
             if let uuid = UUID(uuidString: payload.noteId) {
                 onRemoteNoteDeleted?(uuid)
@@ -711,6 +734,22 @@ final class SyncManager: ObservableObject {
 
     private func persistSyncState() {
         persistenceManager.saveSyncSessionState(syncSessionState)
+    }
+
+    private func shouldDeferRemoteChange(noteId: String) -> Bool {
+        localEditFence.shouldDeferRemoteChange(
+            noteId: noteId,
+            hasQueuedMutation: persistenceManager.hasQueuedMutation(noteId: noteId)
+        )
+    }
+
+    private func applyServerNoteAndNotifyIfContentChanged(_ serverNote: ServerNoteDTO) {
+        let noteId = UUID(uuidString: serverNote.id)
+        let previousContent = noteId.flatMap { noteManager.getNote($0)?.content }
+        guard let applied = noteManager.applyServerNote(serverNote) else { return }
+        if previousContent != applied.content {
+            onRemoteNoteApplied?(applied)
+        }
     }
 }
 

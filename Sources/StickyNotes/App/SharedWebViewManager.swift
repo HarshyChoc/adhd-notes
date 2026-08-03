@@ -19,7 +19,7 @@ class SharedWebViewManager {
     private(set) var activeNoteId: UUID?
 
     /// Cached serialized EditorState per note (JSON string from serializeState)
-    private var stateCache: [UUID: String] = [:]
+    private var stateCache = EditorStateCache()
 
     /// Whether the editor JS has finished loading
     private(set) var isReady = false
@@ -283,6 +283,14 @@ class SharedWebViewManager {
         loadNoteContent(noteId, note: note)
     }
 
+    /// Drop any stale serialized document before applying a genuine server content change.
+    /// This also invalidates inactive-note caches so the old document cannot return later.
+    func applyRemoteContent(_ note: Note) {
+        stateCache.discardForRemoteUpdate(noteId: note.id)
+        guard activeNoteId == note.id else { return }
+        loadNoteContent(note.id, note: note)
+    }
+
     /// Flush current note's content/cursor/scroll to NoteManager (for app termination)
     func flushCurrentNoteState() {
         guard let currentId = activeNoteId else { return }
@@ -291,7 +299,7 @@ class SharedWebViewManager {
 
         webView.evaluateJavaScript("window.getContent()") { [weak self] result, _ in
             if let content = result as? String {
-                self?.coordinator?.noteManager.updateNoteContent(currentId, content: content)
+                self?.coordinator?.handleContentChange(noteId: currentId, content: content)
             }
             pending -= 1
         }
@@ -319,7 +327,7 @@ class SharedWebViewManager {
 
     /// Remove cached state for a deleted note
     func removeCachedState(for noteId: UUID) {
-        stateCache.removeValue(forKey: noteId)
+        stateCache.remove(noteId: noteId)
         if activeNoteId == noteId {
             activeNoteId = nil
         }
