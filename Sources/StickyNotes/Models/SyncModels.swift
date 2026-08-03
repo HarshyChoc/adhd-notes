@@ -24,7 +24,7 @@ struct TaskListInfo: Identifiable, Codable, Equatable {
 }
 
 struct SyncSessionState: Codable, Equatable {
-    static let productionBackendBaseURL = "https://api.mdstickynotes.com"
+    static let productionBackendBaseURL = "https://backend-production-15d8.up.railway.app"
 
     var customBackendBaseURL: String?
     var useCustomBackendBaseURL: Bool

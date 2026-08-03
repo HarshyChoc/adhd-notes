@@ -148,9 +148,11 @@ final class NoteManager: ObservableObject {
 
     func assignDefaultTaskListToUnsyncedNotes(_ defaultList: TaskListInfo) -> [Note] {
         var changed: [Note] = []
-        for index in notes.indices where notes[index].taskListId == nil && notes[index].serverVersion == 0 {
-            notes[index].taskListId = defaultList.id
-            notes[index].taskListNameCache = defaultList.title
+        for index in notes.indices where notes[index].serverVersion == 0 {
+            if notes[index].taskListId == nil {
+                notes[index].taskListId = defaultList.id
+                notes[index].taskListNameCache = defaultList.title
+            }
             notes[index].syncState = .pending
             notes[index].updateModificationDate()
             persistenceManager.saveNote(notes[index])

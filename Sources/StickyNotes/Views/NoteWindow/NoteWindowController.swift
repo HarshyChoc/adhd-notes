@@ -342,7 +342,12 @@ class NoteWindowController: NSWindowController, NSWindowDelegate {
     /// Attach the shared WKWebView to this window and switch editor to this note.
     /// Uses synchronous RunLoop-spin snapshot to avoid async timing gaps.
     func attachWebView() {
-        guard !hasWebView else { return }
+        guard !hasWebView else {
+            if SharedWebViewManager.shared.isReady {
+                revealWebView()
+            }
+            return
+        }
 
         let manager = SharedWebViewManager.shared
         let wv = manager.webView

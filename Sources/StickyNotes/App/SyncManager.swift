@@ -15,7 +15,7 @@ final class SyncManager: ObservableObject {
     private let noteManager: NoteManager
     private let sessionKeychain = KeychainHelper(
         service: "com.mdstickynotes.backend-session",
-        account: "primary"
+        account: "MD Sticky Notes backend session"
     )
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()

@@ -11,6 +11,13 @@ final class KeychainHelper {
     }
 
     func loadString() -> String? {
+        if let value = loadStringFromCurrentItem() {
+            return value
+        }
+        return migrateLegacySessionTokenIfNeeded()
+    }
+
+    private func loadStringFromCurrentItem() -> String? {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -45,7 +52,27 @@ final class KeychainHelper {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrAccount as String: account,
+            kSecAttrLabel as String: account,
+            kSecAttrDescription as String: "MD Sticky Notes backend session token"
         ]
+    }
+
+    private func migrateLegacySessionTokenIfNeeded() -> String? {
+        guard service == "com.mdstickynotes.backend-session",
+              account == "MD Sticky Notes backend session" else {
+            return nil
+        }
+
+        let legacy = KeychainHelper(
+            service: "com.mdstickynotes.backend-session",
+            account: "primary"
+        )
+        guard let value = legacy.loadStringFromCurrentItem() else {
+            return nil
+        }
+        saveString(value)
+        legacy.deleteValue()
+        return value
     }
 }

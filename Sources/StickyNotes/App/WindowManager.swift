@@ -79,6 +79,9 @@ class WindowManager: ObservableObject {
             return
         }
 
+        windowController.moveToActiveSpaceIfNeeded()
+        NSApp.activate(ignoringOtherApps: true)
+        windowController.window?.orderFrontRegardless()
         windowController.window?.makeKeyAndOrderFront(nil)
     }
 

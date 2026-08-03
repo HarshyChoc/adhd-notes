@@ -8,6 +8,7 @@ final class AppCoordinator: ObservableObject {
     @Published var noteManager: NoteManager
     @Published var windowManager: WindowManager
     @Published var syncManager: SyncManager
+    @Published var launchAtLoginManager: LaunchAtLoginManager
     @Published private(set) var areNotesHidden = false
 
     var isQuitting = false
@@ -21,6 +22,7 @@ final class AppCoordinator: ObservableObject {
         self.persistenceManager = persistenceManager
         self.noteManager = noteManager
         self.windowManager = WindowManager()
+        self.launchAtLoginManager = LaunchAtLoginManager()
         self.syncManager = SyncManager(
             persistenceManager: persistenceManager,
             noteManager: noteManager
@@ -106,6 +108,7 @@ final class AppCoordinator: ObservableObject {
             windowManager.openWindow(for: note, coordinator: self)
             windowManager.showWindow(note.id)
         }
+        restoreLastActiveNote(after: 0)
         if wasHidden {
             syncManager.syncNow()
         }
@@ -120,6 +123,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     func hideAllNotes() {
+        saveLastActiveNote()
         areNotesHidden = true
         windowManager.hideAllWindows()
     }
@@ -187,17 +191,23 @@ final class AppCoordinator: ObservableObject {
     private static let lastActiveNoteKey = "lastActiveNoteId"
 
     func saveLastActiveNote() {
-        if let noteId = focusedNoteId() {
+        if let noteId = SharedWebViewManager.shared.activeNoteId ?? focusedNoteId() {
             UserDefaults.standard.set(noteId.uuidString, forKey: Self.lastActiveNoteKey)
         }
     }
 
-    func restoreLastActiveNote() {
+    func restoreLastActiveNote(after delay: TimeInterval = 0.3) {
         guard let idString = UserDefaults.standard.string(forKey: Self.lastActiveNoteKey),
               let noteId = UUID(uuidString: idString) else { return }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.windowManager.bringToFront(noteId)
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.windowManager.bringToFront(noteId)
+            }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.windowManager.bringToFront(noteId)
+            }
         }
     }
 

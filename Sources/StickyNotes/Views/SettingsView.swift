@@ -3,14 +3,43 @@ import SwiftUI
 struct SettingsView: View {
     let coordinator: AppCoordinator
     @ObservedObject private var syncManager: SyncManager
+    @ObservedObject private var launchAtLoginManager: LaunchAtLoginManager
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         _syncManager = ObservedObject(wrappedValue: coordinator.syncManager)
+        _launchAtLoginManager = ObservedObject(wrappedValue: coordinator.launchAtLoginManager)
     }
 
     var body: some View {
         Form {
+            Section("App") {
+                Toggle(
+                    "Open MD Sticky Notes when this Mac starts",
+                    isOn: Binding(
+                        get: { launchAtLoginManager.isEnabled },
+                        set: { launchAtLoginManager.setEnabled($0) }
+                    )
+                )
+                .disabled(!launchAtLoginManager.isSupported)
+
+                Text("Starts the app automatically when you sign in to this Mac.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                if !launchAtLoginManager.isSupported {
+                    Text("Launch at login requires macOS 13 or newer.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let error = launchAtLoginManager.errorMessage {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+
             Section("Backend") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Production API")
@@ -107,6 +136,9 @@ struct SettingsView: View {
             }
         }
         .padding(20)
-        .frame(width: 520, height: 420)
+        .frame(width: 520, height: 470)
+        .onAppear {
+            launchAtLoginManager.refresh()
+        }
     }
 }
