@@ -527,13 +527,15 @@ final class SyncManager: ObservableObject {
 
     private func startEventStream() {
         eventStreamTask?.cancel()
-        guard let request = makeRequest(
+        guard var request = makeRequest(
             path: "/v1/events/stream?since=\(syncSessionState.lastEventSequence)",
             method: "GET",
             authorized: true
         ) else {
             return
         }
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
 
         eventStreamTask = Task { [weak self] in
             guard let self else { return }
