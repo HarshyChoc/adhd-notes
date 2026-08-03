@@ -29,8 +29,8 @@ const mutationSchema = z.discriminatedUnion("type", [
     payload: z.object({
       content: z.string().max(1_000_000),
       taskListId: z.string().min(1).max(4096),
-      taskListNameCache: z.string().max(4096).nullable(),
-      dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+      taskListNameCache: z.string().max(4096).nullish().transform((value) => value ?? null),
+      dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish().transform((value) => value ?? null),
     }),
   }),
   mutationBaseSchema.extend({

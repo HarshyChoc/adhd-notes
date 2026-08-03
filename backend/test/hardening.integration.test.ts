@@ -179,6 +179,34 @@ test("authenticated notes cannot be unassigned", async () => {
   assert.equal(response.statusCode, 400);
 });
 
+test("upserts accept omitted nullable fields from the macOS encoder", async () => {
+  const { token, userId } = await authenticatedSession();
+  const noteId = randomUUID();
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/mutations",
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      mutations: [{
+        id: randomUUID(),
+        type: "upsert_note",
+        noteId,
+        baseServerVersion: 0,
+        payload: {
+          content: "# Encoded by macOS",
+          taskListId: "mock-inbox",
+        },
+      }],
+    },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  const note = await prisma.note.findUniqueOrThrow({ where: { id: noteId } });
+  assert.equal(note.userId, userId);
+  assert.equal(note.taskListNameCache, null);
+  assert.equal(note.dueDate, null);
+});
+
 test("projection generations prevent a stale worker from clearing newer work", async () => {
   const { token, userId } = await authenticatedSession();
   const headers = { authorization: `Bearer ${token}` };
