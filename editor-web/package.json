@@ -6,7 +6,7 @@
   "scripts": {
     "build": "webpack",
     "watch": "webpack --watch",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
@@ -35,8 +35,8 @@
     "@codemirror/search": "^6.6.0",
     "@codemirror/state": "^6.5.4",
     "@codemirror/view": "^6.39.12",
-    "katex": "^0.16.28",
-    "markdown-it": "^14.1.0",
+    "katex": "^0.18.1",
+    "markdown-it": "^15.0.0",
     "markdown-it-mark": "^4.0.0"
   },
   "devDependencies": {

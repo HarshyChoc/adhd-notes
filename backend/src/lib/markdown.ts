@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const MARKDOWN_SPECIALS = /([\\`*_{}[\]()#+\-.!|>~])/g;
 
 export function stripMarkdown(input: string): string {
@@ -31,10 +33,26 @@ export function deriveNoteContentParts(markdown: string): {
   const title = stripMarkdown(titleSource).slice(0, 1024) || "Untitled";
 
   const bodyLines = firstNonEmptyIndex >= 0 ? rawLines.slice(firstNonEmptyIndex + 1) : [];
-  const bodyMarkdown = bodyLines.join("\n").trim();
-  const bodyPlaintext = stripMarkdown(bodyMarkdown).slice(0, 8192);
+  const bodyMarkdown = markdown;
+  const bodyPlaintext = stripMarkdown(bodyLines.join("\n")).slice(0, 8192);
 
   return { title, bodyMarkdown, bodyPlaintext };
+}
+
+export function projectedTaskFingerprint(input: {
+  title: string;
+  notes: string;
+  dueDate: string | null;
+  taskListId: string;
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      title: input.title,
+      notes: input.notes,
+      dueDate: input.dueDate,
+      taskListId: input.taskListId,
+    }))
+    .digest("hex");
 }
 
 export function plainTaskToMarkdown(title: string, notes: string): string {

@@ -9,27 +9,38 @@ final class PersistenceManager: ObservableObject {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let legacyNotesKey = "sticky_notes"
+    @Published private(set) var errorMessage: String?
+    private(set) var isReady = false
 
-    init() {
+    init(databaseURL: URL? = nil, migrateUserDefaults: Bool = true) {
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
 
-        let dbURL = Self.databaseURL()
-        try? FileManager.default.createDirectory(
-            at: dbURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        let dbURL = databaseURL ?? Self.databaseURL()
+        do {
+            try FileManager.default.createDirectory(
+                at: dbURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            self.db = nil
+            errorMessage = "Unable to create the notes data directory: \(error.localizedDescription)"
+            return
+        }
 
         var handle: OpaquePointer?
         if sqlite3_open(dbURL.path, &handle) != SQLITE_OK {
-            print("[PersistenceManager] Failed to open SQLite database at \(dbURL.path)")
+            errorMessage = "Unable to open the notes database at \(dbURL.path)."
             self.db = nil
             return
         }
         self.db = handle
 
-        runMigrations()
-        migrateLegacyNotesIfNeeded()
+        guard runMigrations() else { return }
+        isReady = true
+        if migrateUserDefaults {
+            migrateLegacyNotesIfNeeded()
+        }
     }
 
     deinit {
@@ -45,7 +56,8 @@ final class PersistenceManager: ObservableObject {
         return queryNotes(sql: sql)
     }
 
-    func saveNote(_ note: Note) {
+    @discardableResult
+    func saveNote(_ note: Note) -> Bool {
         let sql = """
         INSERT INTO notes (
             id, content, position_x, position_y, size_w, size_h, is_minimized, opacity,
@@ -77,7 +89,7 @@ final class PersistenceManager: ObservableObject {
             modified_at = excluded.modified_at;
         """
 
-        guard let statement = prepare(sql) else { return }
+        guard let statement = prepare(sql) else { return false }
         defer { sqlite3_finalize(statement) }
 
         bind(statement, index: 1, value: note.id.uuidString)
@@ -102,52 +114,83 @@ final class PersistenceManager: ObservableObject {
         bind(statement, index: 20, value: Self.iso8601(note.deletedAt))
         bind(statement, index: 21, value: Self.iso8601(note.createdAt))
         bind(statement, index: 22, value: Self.iso8601(note.modifiedAt))
-        step(statement)
+        return step(statement)
     }
 
-    func saveNotes(_ notes: [Note]) {
-        execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+    @discardableResult
+    func saveNotes(_ notes: [Note]) -> Bool {
+        guard execute(sql: "BEGIN IMMEDIATE TRANSACTION;") else { return false }
         for note in notes {
-            saveNote(note)
+            guard saveNote(note) else {
+                _ = execute(sql: "ROLLBACK;")
+                return false
+            }
         }
-        execute(sql: "COMMIT;")
+        return execute(sql: "COMMIT;")
     }
 
-    func tombstoneNote(_ noteId: UUID, reason: String, syncState: NoteSyncState = .pending) {
+    @discardableResult
+    func tombstoneNote(
+        _ noteId: UUID,
+        reason: String,
+        syncState: NoteSyncState = .pending,
+        serverVersion: Int? = nil,
+        serverUpdatedAt: Date? = nil,
+        deletedAt: Date? = nil
+    ) -> Bool {
         let sql = """
         UPDATE notes
-        SET deleted_at = ?, deletion_reason = ?, modified_at = ?, sync_state = ?
+        SET deleted_at = ?, deletion_reason = ?, modified_at = ?, sync_state = ?,
+            server_version = COALESCE(?, server_version),
+            server_updated_at = COALESCE(?, server_updated_at)
         WHERE id = ?;
         """
-        guard let statement = prepare(sql) else { return }
+        guard let statement = prepare(sql) else { return false }
         defer { sqlite3_finalize(statement) }
-        let now = Date()
+        let now = deletedAt ?? Date()
         bind(statement, index: 1, value: Self.iso8601(now))
         bind(statement, index: 2, value: reason)
         bind(statement, index: 3, value: Self.iso8601(now))
         bind(statement, index: 4, value: syncState.rawValue)
-        bind(statement, index: 5, value: noteId.uuidString)
-        step(statement)
+        if let serverVersion {
+            sqlite3_bind_int(statement, 5, Int32(serverVersion))
+        } else {
+            sqlite3_bind_null(statement, 5)
+        }
+        bind(statement, index: 6, value: Self.iso8601(serverUpdatedAt))
+        bind(statement, index: 7, value: noteId.uuidString)
+        return step(statement)
     }
 
-    func saveTaskLists(_ taskLists: [TaskListInfo]) {
-        execute(sql: "DELETE FROM task_lists;")
-        execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+    @discardableResult
+    func saveTaskLists(_ taskLists: [TaskListInfo]) -> Bool {
+        guard execute(sql: "BEGIN IMMEDIATE TRANSACTION;") else { return false }
+        guard execute(sql: "DELETE FROM task_lists;") else {
+            _ = execute(sql: "ROLLBACK;")
+            return false
+        }
         let sql = """
         INSERT INTO task_lists (id, title, is_selected, is_default, updated_at)
         VALUES (?, ?, ?, ?, ?);
         """
         for list in taskLists {
-            guard let statement = prepare(sql) else { continue }
+            guard let statement = prepare(sql) else {
+                _ = execute(sql: "ROLLBACK;")
+                return false
+            }
             bind(statement, index: 1, value: list.id)
             bind(statement, index: 2, value: list.title)
             sqlite3_bind_int(statement, 3, list.isSelected ? 1 : 0)
             sqlite3_bind_int(statement, 4, list.isDefault ? 1 : 0)
             bind(statement, index: 5, value: Self.iso8601(Date()))
-            step(statement)
+            guard step(statement) else {
+                sqlite3_finalize(statement)
+                _ = execute(sql: "ROLLBACK;")
+                return false
+            }
             sqlite3_finalize(statement)
         }
-        execute(sql: "COMMIT;")
+        return execute(sql: "COMMIT;")
     }
 
     func loadTaskLists() -> [TaskListInfo] {
@@ -166,7 +209,8 @@ final class PersistenceManager: ObservableObject {
         return results
     }
 
-    func saveSyncSessionState(_ state: SyncSessionState) {
+    @discardableResult
+    func saveSyncSessionState(_ state: SyncSessionState) -> Bool {
         saveAppState(key: "sync_session", encodable: state)
     }
 
@@ -174,34 +218,37 @@ final class PersistenceManager: ObservableObject {
         loadAppState(key: "sync_session", as: SyncSessionState.self) ?? .defaultValue
     }
 
-    func saveQueuedMutation(_ mutation: QueuedMutation) {
+    @discardableResult
+    func saveQueuedMutation(_ mutation: QueuedMutation) -> Bool {
         let sql = """
         INSERT INTO outbox_mutations (
-            id, coalesce_key, note_id, mutation_type, payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, coalesce_key, note_id, mutation_type, base_server_version, payload_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(coalesce_key) DO UPDATE SET
             id = excluded.id,
             note_id = excluded.note_id,
             mutation_type = excluded.mutation_type,
+            base_server_version = excluded.base_server_version,
             payload_json = excluded.payload_json,
             updated_at = excluded.updated_at;
         """
-        guard let statement = prepare(sql) else { return }
+        guard let statement = prepare(sql) else { return false }
         defer { sqlite3_finalize(statement) }
 
         bind(statement, index: 1, value: mutation.id)
         bind(statement, index: 2, value: mutation.coalesceKey)
         bind(statement, index: 3, value: mutation.noteId)
         bind(statement, index: 4, value: mutation.type.rawValue)
-        bind(statement, index: 5, value: mutation.payloadJSON)
-        bind(statement, index: 6, value: Self.iso8601(mutation.createdAt))
-        bind(statement, index: 7, value: Self.iso8601(mutation.updatedAt))
-        step(statement)
+        sqlite3_bind_int(statement, 5, Int32(mutation.baseServerVersion))
+        bind(statement, index: 6, value: mutation.payloadJSON)
+        bind(statement, index: 7, value: Self.iso8601(mutation.createdAt))
+        bind(statement, index: 8, value: Self.iso8601(mutation.updatedAt))
+        return step(statement)
     }
 
     func loadQueuedMutations() -> [QueuedMutation] {
         let sql = """
-        SELECT id, coalesce_key, note_id, mutation_type, payload_json, created_at, updated_at
+        SELECT id, coalesce_key, note_id, mutation_type, base_server_version, payload_json, created_at, updated_at
         FROM outbox_mutations ORDER BY created_at ASC;
         """
         guard let statement = prepare(sql) else { return [] }
@@ -215,9 +262,9 @@ final class PersistenceManager: ObservableObject {
                 let noteId = string(statement, index: 2),
                 let typeRaw = string(statement, index: 3),
                 let type = SyncMutationType(rawValue: typeRaw),
-                let payloadJSON = string(statement, index: 4),
-                let createdAt = Self.date(from: string(statement, index: 5)),
-                let updatedAt = Self.date(from: string(statement, index: 6))
+                let payloadJSON = string(statement, index: 5),
+                let createdAt = Self.date(from: string(statement, index: 6)),
+                let updatedAt = Self.date(from: string(statement, index: 7))
             else {
                 continue
             }
@@ -227,6 +274,7 @@ final class PersistenceManager: ObservableObject {
                     coalesceKey: coalesceKey,
                     noteId: noteId,
                     type: type,
+                    baseServerVersion: Int(sqlite3_column_int(statement, 4)),
                     payloadJSON: payloadJSON,
                     createdAt: createdAt,
                     updatedAt: updatedAt
@@ -236,17 +284,58 @@ final class PersistenceManager: ObservableObject {
         return results
     }
 
-    func deleteQueuedMutations(ids: [String]) {
-        guard !ids.isEmpty else { return }
-        execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+    @discardableResult
+    func deleteQueuedMutations(ids: [String]) -> Bool {
+        guard !ids.isEmpty else { return true }
+        guard execute(sql: "BEGIN IMMEDIATE TRANSACTION;") else { return false }
         let sql = "DELETE FROM outbox_mutations WHERE id = ?;"
         for id in ids {
-            guard let statement = prepare(sql) else { continue }
+            guard let statement = prepare(sql) else {
+                _ = execute(sql: "ROLLBACK;")
+                return false
+            }
             bind(statement, index: 1, value: id)
-            step(statement)
+            guard step(statement) else {
+                sqlite3_finalize(statement)
+                _ = execute(sql: "ROLLBACK;")
+                return false
+            }
             sqlite3_finalize(statement)
         }
-        execute(sql: "COMMIT;")
+        return execute(sql: "COMMIT;")
+    }
+
+    @discardableResult
+    func deleteQueuedMutations(noteId: String) -> Bool {
+        let sql = "DELETE FROM outbox_mutations WHERE note_id = ?;"
+        guard let statement = prepare(sql) else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(statement, index: 1, value: noteId)
+        return step(statement)
+    }
+
+    func hasQueuedMutation(noteId: String, excludingIDs: Set<String> = []) -> Bool {
+        let sql = "SELECT id FROM outbox_mutations WHERE note_id = ? ORDER BY updated_at DESC;"
+        guard let statement = prepare(sql) else { return false }
+        defer { sqlite3_finalize(statement) }
+        bind(statement, index: 1, value: noteId)
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let id = string(statement, index: 0), !excludingIDs.contains(id) {
+                return true
+            }
+        }
+        return false
+    }
+
+    @discardableResult
+    func rebaseQueuedMutations(noteId: String, baseServerVersion: Int) -> Bool {
+        let sql = "UPDATE outbox_mutations SET base_server_version = ?, updated_at = ? WHERE note_id = ?;"
+        guard let statement = prepare(sql) else { return false }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(baseServerVersion))
+        bind(statement, index: 2, value: Self.iso8601(Date()))
+        bind(statement, index: 3, value: noteId)
+        return step(statement)
     }
 
     func clearTaskLists() {
@@ -317,20 +406,28 @@ final class PersistenceManager: ObservableObject {
         )
     }
 
-    private func saveAppState<T: Encodable>(key: String, encodable: T) {
-        guard
-            let data = try? encoder.encode(encodable),
-            let json = String(data: data, encoding: .utf8)
-        else { return }
+    @discardableResult
+    private func saveAppState<T: Encodable>(key: String, encodable: T) -> Bool {
+        let data: Data
+        do {
+            data = try encoder.encode(encodable)
+        } catch {
+            recordError("Local app state could not be encoded: \(error.localizedDescription)")
+            return false
+        }
+        guard let json = String(data: data, encoding: .utf8) else {
+            recordError("Local app state could not be converted to UTF-8.")
+            return false
+        }
         let sql = """
         INSERT INTO app_state (key, value_json) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json;
         """
-        guard let statement = prepare(sql) else { return }
+        guard let statement = prepare(sql) else { return false }
         defer { sqlite3_finalize(statement) }
         bind(statement, index: 1, value: key)
         bind(statement, index: 2, value: json)
-        step(statement)
+        return step(statement)
     }
 
     private func loadAppState<T: Decodable>(key: String, as type: T.Type) -> T? {
@@ -345,8 +442,10 @@ final class PersistenceManager: ObservableObject {
         return try? decoder.decode(type, from: data)
     }
 
-    private func runMigrations() {
-        execute(sql: """
+    @discardableResult
+    private func runMigrations() -> Bool {
+        guard execute(sql: "BEGIN IMMEDIATE TRANSACTION;") else { return false }
+        guard execute(sql: """
         CREATE TABLE IF NOT EXISTS notes (
             id TEXT PRIMARY KEY,
             content TEXT NOT NULL,
@@ -371,9 +470,9 @@ final class PersistenceManager: ObservableObject {
             created_at TEXT NOT NULL,
             modified_at TEXT NOT NULL
         );
-        """)
+        """) else { return rollbackMigration() }
 
-        execute(sql: """
+        guard execute(sql: """
         CREATE TABLE IF NOT EXISTS task_lists (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -381,26 +480,174 @@ final class PersistenceManager: ObservableObject {
             is_default INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
-        """)
+        """) else { return rollbackMigration() }
 
-        execute(sql: """
+        guard execute(sql: """
         CREATE TABLE IF NOT EXISTS outbox_mutations (
             id TEXT PRIMARY KEY,
             coalesce_key TEXT NOT NULL UNIQUE,
             note_id TEXT NOT NULL,
             mutation_type TEXT NOT NULL,
+            base_server_version INTEGER NOT NULL DEFAULT 0,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        """)
+        """) else { return rollbackMigration() }
 
-        execute(sql: """
+        if !columnExists(table: "outbox_mutations", column: "base_server_version") {
+            guard execute(sql: "ALTER TABLE outbox_mutations ADD COLUMN base_server_version INTEGER NOT NULL DEFAULT 0;") else {
+                return rollbackMigration()
+            }
+        }
+
+        if sqliteUserVersion() < 2 {
+            guard migrateOutboxToFullNoteMutations() else {
+                return rollbackMigration()
+            }
+        }
+
+        guard execute(sql: """
         CREATE TABLE IF NOT EXISTS app_state (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL
         );
-        """)
+        """) else { return rollbackMigration() }
+
+        guard execute(sql: "PRAGMA user_version = 2;") else { return rollbackMigration() }
+        return execute(sql: "COMMIT;")
+    }
+
+    private func rollbackMigration() -> Bool {
+        _ = execute(sql: "ROLLBACK;")
+        return false
+    }
+
+    private func columnExists(table: String, column: String) -> Bool {
+        guard let statement = prepare("PRAGMA table_info(\(table));") else { return false }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if string(statement, index: 1) == column { return true }
+        }
+        return false
+    }
+
+    private func sqliteUserVersion() -> Int {
+        guard let statement = prepare("PRAGMA user_version;") else { return 0 }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
+    /// Version 2 replaces field-specific mutations with one complete snapshot per note.
+    /// The migration rebuilds from the canonical local note row so a queued body update
+    /// cannot accidentally omit a newer list, due date, or Markdown title.
+    private func migrateOutboxToFullNoteMutations() -> Bool {
+        let sql = """
+        SELECT
+            lower(o.note_id),
+            MIN(o.created_at),
+            MAX(o.updated_at),
+            MAX(CASE WHEN o.mutation_type = 'delete_note' THEN 1 ELSE 0 END),
+            n.content,
+            n.task_list_id,
+            n.task_list_name,
+            n.due_date,
+            n.server_version,
+            n.deleted_at
+        FROM outbox_mutations o
+        LEFT JOIN notes n ON lower(n.id) = lower(o.note_id)
+        GROUP BY lower(o.note_id);
+        """
+        guard let statement = prepare(sql) else { return false }
+
+        struct MigratedMutation {
+            let noteId: String
+            let createdAt: String
+            let updatedAt: String
+            let type: SyncMutationType
+            let baseServerVersion: Int
+            let payloadJSON: String
+        }
+
+        var migrated: [MigratedMutation] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard
+                let noteId = string(statement, index: 0),
+                let createdAt = string(statement, index: 1),
+                let updatedAt = string(statement, index: 2)
+            else {
+                sqlite3_finalize(statement)
+                recordError("An existing pending change could not be read during migration.")
+                return false
+            }
+
+            let shouldDelete = sqlite3_column_int(statement, 3) == 1 || string(statement, index: 9) != nil
+            let payload: [String: Any]
+            let type: SyncMutationType
+            if shouldDelete {
+                type = .deleteNote
+                payload = [:]
+            } else {
+                guard let content = string(statement, index: 4) else {
+                    sqlite3_finalize(statement)
+                    recordError("A pending note snapshot is missing from the local database.")
+                    return false
+                }
+                type = .upsertNote
+                payload = [
+                    "content": content,
+                    "taskListId": string(statement, index: 5) ?? NSNull(),
+                    "taskListNameCache": string(statement, index: 6) ?? NSNull(),
+                    "dueDate": string(statement, index: 7) ?? NSNull()
+                ]
+            }
+
+            guard
+                let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+                let payloadJSON = String(data: data, encoding: .utf8)
+            else {
+                sqlite3_finalize(statement)
+                recordError("A pending note snapshot could not be encoded during migration.")
+                return false
+            }
+
+            migrated.append(
+                MigratedMutation(
+                    noteId: noteId,
+                    createdAt: createdAt,
+                    updatedAt: updatedAt,
+                    type: type,
+                    baseServerVersion: Int(sqlite3_column_int(statement, 8)),
+                    payloadJSON: payloadJSON
+                )
+            )
+        }
+        sqlite3_finalize(statement)
+
+        guard execute(sql: "DELETE FROM outbox_mutations;") else { return false }
+        let insertSQL = """
+        INSERT INTO outbox_mutations (
+            id, coalesce_key, note_id, mutation_type, base_server_version, payload_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        for mutation in migrated {
+            guard let insert = prepare(insertSQL) else { return false }
+            bind(insert, index: 1, value: UUID().uuidString.lowercased())
+            bind(insert, index: 2, value: "note:\(mutation.noteId)")
+            bind(insert, index: 3, value: mutation.noteId)
+            bind(insert, index: 4, value: mutation.type.rawValue)
+            sqlite3_bind_int(insert, 5, Int32(mutation.baseServerVersion))
+            bind(insert, index: 6, value: mutation.payloadJSON)
+            bind(insert, index: 7, value: mutation.createdAt)
+            bind(insert, index: 8, value: mutation.updatedAt)
+            guard step(insert) else {
+                sqlite3_finalize(insert)
+                return false
+            }
+            sqlite3_finalize(insert)
+        }
+        return true
     }
 
     private func migrateLegacyNotesIfNeeded() {
@@ -416,15 +663,18 @@ final class PersistenceManager: ObservableObject {
 
         do {
             let notes = try decoder.decode([Note].self, from: data)
-            for note in notes where !noteExists(note.id) {
-                saveNote(note)
+            let notesToMigrate = notes.filter { !noteExists($0.id) }
+            guard saveNotes(notesToMigrate) else {
+                recordError("Legacy notes were decoded but could not be saved to SQLite.")
+                return
             }
             print("[PersistenceManager] Migrated \(notes.count) notes from UserDefaults to SQLite")
         } catch {
-            print("[PersistenceManager] Failed to migrate legacy UserDefaults notes: \(error)")
+            recordError("Legacy notes could not be decoded: \(error.localizedDescription)")
+            return
         }
 
-        saveAppState(key: "legacy_userdefaults_migrated", encodable: true)
+        _ = saveAppState(key: "legacy_userdefaults_migrated", encodable: true)
     }
 
     private func noteExists(_ id: UUID) -> Bool {
@@ -436,31 +686,47 @@ final class PersistenceManager: ObservableObject {
     }
 
     private func prepare(_ sql: String) -> OpaquePointer? {
-        guard let db else { return nil }
+        guard let db else {
+            recordError("The notes database is unavailable.")
+            return nil
+        }
         var statement: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
             if let error = sqlite3_errmsg(db) {
-                print("[PersistenceManager] SQLite prepare failed: \(String(cString: error))")
+                recordError("SQLite prepare failed: \(String(cString: error))")
             }
             return nil
         }
         return statement
     }
 
-    private func execute(sql: String) {
-        guard let db else { return }
-        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK, let error = sqlite3_errmsg(db) {
-            print("[PersistenceManager] SQLite exec failed: \(String(cString: error))")
+    @discardableResult
+    private func execute(sql: String) -> Bool {
+        guard let db else {
+            recordError("The notes database is unavailable.")
+            return false
         }
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK, let error = sqlite3_errmsg(db) {
+            recordError("SQLite exec failed: \(String(cString: error))")
+            return false
+        }
+        return true
     }
 
-    private func step(_ statement: OpaquePointer?) {
+    @discardableResult
+    private func step(_ statement: OpaquePointer?) -> Bool {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             if let db, let error = sqlite3_errmsg(db) {
-                print("[PersistenceManager] SQLite step failed: \(String(cString: error))")
+                recordError("SQLite write failed: \(String(cString: error))")
             }
-            return
+            return false
         }
+        return true
+    }
+
+    private func recordError(_ message: String) {
+        errorMessage = message
+        print("[PersistenceManager] \(message)")
     }
 
     private func bind(_ statement: OpaquePointer?, index: Int32, value: String?) {

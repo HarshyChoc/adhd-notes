@@ -1,17 +1,17 @@
-# ADHD Notes
+# MD Sticky Notes
 
-ADHD Notes is a native macOS task and to-do tracker for people who need their work to stay visible. It is meant for users who like the utility of Google Tasks but do not feel urgency from a regular list hidden in a tab or sidebar.
+MD Sticky Notes is a native macOS task and note app for people who need their work to stay visible. It combines floating Markdown notes with optional Google Tasks synchronization.
 
-Instead of making every task live in one passive checklist, ADHD Notes turns tasks into floating markdown sticky notes that can stay on screen, carry due dates, use colors, and optionally sync with Google Tasks.
+Instead of making every task live in one passive checklist, MD Sticky Notes turns tasks into floating Markdown windows that can stay on screen, carry due dates, use colors, and optionally sync with Google Tasks.
 
 ![macOS 12+](https://img.shields.io/badge/macOS-12%2B-blue)
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)
 
-![ADHD Notes screenshot](assets/screenshot.png)
+![MD Sticky Notes screenshot](assets/screenshot.png)
 
 ## Why It Exists
 
-Normal task apps are easy to ignore when the task list is out of sight. ADHD Notes is built around visual persistence:
+Normal task apps are easy to ignore when the task list is out of sight. MD Sticky Notes is built around visual persistence:
 
 - tasks can stay as always-available floating notes
 - markdown keeps notes flexible enough for checklists, context, links, and quick dumps
@@ -24,7 +24,8 @@ Normal task apps are easy to ignore when the task list is out of sight. ADHD Not
 - One shared `WKWebView` reparented across note windows to keep memory usage low
 - Local SQLite persistence for note content, window state, sync state, and mutation outbox
 - Optional Google Tasks sync through the repo-local `backend/` service
-- Global show/hide hotkey, per-note due dates, custom colors, and manual `Sync Now`
+- Global modifier chords that work while another app is focused: release Control+Option to create a note and release Option+Command to show/hide notes
+- Per-note due dates, custom colors, and manual `Sync Now`
 
 ## Privacy And Security
 
@@ -85,7 +86,7 @@ The macOS app talks to the backend, and the backend owns the Google OAuth refres
 
 1. Create a Google OAuth web application client
 2. Enable the Google Tasks API
-3. Set the redirect URI to `http://127.0.0.1:8787/auth/google/callback`
+3. Set the redirect URI to the backend callback URL
 4. Fill out `backend/.env` from `backend/.env.example`
 
 Then:
@@ -93,7 +94,7 @@ Then:
 ```bash
 cd backend
 npm install
-npx prisma db push
+npx prisma migrate deploy
 npm run dev
 ```
 
@@ -106,20 +107,19 @@ More details are in [backend/README.md](backend/README.md).
 This repo includes the repo-side pieces needed to run a hosted private beta:
 
 - multi-user backend lookup keyed by Google subject instead of a single local user
-- authenticated internal cron endpoint at `POST /internal/cron/sync`
-- Cloud Run / Cloud Scheduler deploy scripts
-- backend Dockerfile and Prisma migration baseline
+- an authenticated optional cron endpoint at `POST /internal/cron/sync`
+- a Railway service rooted at `backend/` with managed Postgres and `/healthz` readiness checks
+- a backend Dockerfile and additive Prisma migrations
 - build pipeline support for Developer ID signing, hardened runtime, notarization, stapling, ZIP, and DMG artifacts
 
 Key production files:
 
 - [build-app.sh](build-app.sh)
 - [backend/Dockerfile](backend/Dockerfile)
-- [scripts/deploy-backend-gcp.sh](scripts/deploy-backend-gcp.sh)
-- [scripts/deploy-scheduler-gcp.sh](scripts/deploy-scheduler-gcp.sh)
-- [infra/gcp/README.md](infra/gcp/README.md)
+- [backend/railway.json](backend/railway.json)
+- [docs/architecture.md](docs/architecture.md)
 
-Localhost is supported through the explicit development override in Settings.
+The canonical production API is `https://backend-production-15d8.up.railway.app`. Localhost is supported only through the explicit development override in Settings. The files under `infra/gcp/` and the GCP scripts are optional reference material and are not invoked by CI.
 
 ## Release Builds
 
@@ -155,6 +155,8 @@ Useful environment overrides:
 - `backend/src`: Fastify + Prisma backend for OAuth, sync state, projection, polling, and SSE
 
 The most important app-level architectural choice is that it uses one shared `WKWebView` across note windows. The active window owns the live editor and inactive windows show snapshots or previews.
+
+The complete component, function, route, sync-flow, and hosting map is in [docs/architecture.md](docs/architecture.md).
 
 ## License
 

@@ -1,11 +1,14 @@
-# Google Cloud Deployment
+# Optional Google Cloud Reference
+
+Railway is the canonical production host. These scripts are retained only as
+reference material for a possible manual Cloud Run migration; pushing `main`
+does not invoke them.
 
 This repo now includes the production deployment scaffolding for the hosted backend:
 
 - `backend/Dockerfile`
 - `scripts/deploy-backend-gcp.sh`
 - `scripts/deploy-scheduler-gcp.sh`
-- `.github/workflows/deploy-backend.yml`
 
 Required Google Cloud pieces:
 

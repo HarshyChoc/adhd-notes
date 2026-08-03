@@ -15,6 +15,7 @@ model User {
   googleAccounts        GoogleAccount[]
   appSessions           AppSession[]
   appAuthCodes          AppAuthCode[]
+  oauthStates           OAuthState[]
   taskListSubscriptions TaskListSubscription[]
   syncCheckpoints       SyncCheckpoint[]
   notes                 Note[]
@@ -59,6 +60,19 @@ model AppAuthCode {
   usedAt       DateTime?
   createdAt    DateTime @default(now())
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model OAuthState {
+  id                  String   @id @default(cuid())
+  userId              String?
+  stateHash           String   @unique
+  desktopRedirectUri  String
+  expiresAt           DateTime
+  usedAt              DateTime?
+  createdAt           DateTime @default(now())
+  user                User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
 }
 
 model TaskListSubscription {
@@ -107,6 +121,7 @@ model Note {
   deletionReason     String?
   pendingProjection  Boolean   @default(false)
   lastProjectionError String?
+  lastProjectedFingerprint String?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
   user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -145,6 +160,7 @@ model ProjectionJob {
   runAfter    DateTime @default(now())
   attemptCount Int      @default(0)
   lastError   String?
+  generation  Int      @default(1)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)

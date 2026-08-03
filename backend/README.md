@@ -1,6 +1,6 @@
 # Backend Sync Service
 
-This service is the Google Tasks sync boundary for ADHD Notes. It owns Google OAuth, stores encrypted refresh tokens, keeps Postgres as the canonical note/task state, projects desktop mutations to Google Tasks, polls for remote changes, and streams events back to the macOS app over SSE.
+This service is the Google Tasks sync boundary for MD Sticky Notes. It owns Google OAuth, stores encrypted refresh tokens, keeps Postgres as the canonical synchronized state, projects desktop mutations to Google Tasks, polls for remote changes, and streams events back to the macOS app over SSE.
 
 ## Stack
 
@@ -21,6 +21,7 @@ This service is the Google Tasks sync boundary for ADHD Notes. It owns Google OA
 - `GET /v1/task-lists`
 - `PATCH /v1/preferences/sync`
 - `POST /internal/cron/sync`
+- `GET /healthz`
 
 ## Environment
 
@@ -41,6 +42,8 @@ Important values:
 - `APP_ENCRYPTION_KEY`
 - `INTERNAL_CRON_AUDIENCE`
 - `INTERNAL_CRON_SERVICE_ACCOUNT_EMAIL`
+- `APP_RELEASE_SHA`
+- `SCHEDULED_SYNC_CONCURRENCY`
 
 Generate a local encryption key with:
 
@@ -62,7 +65,7 @@ openssl rand -base64 32
 cd backend
 npm install
 npx prisma generate
-npx prisma db push
+npx prisma migrate deploy
 npm run dev
 ```
 
@@ -76,20 +79,20 @@ The desktop callback remains:
 
 ## Production Hosting
 
-The repo now includes:
+Railway is the canonical production host. The linked project uses a service rooted at `backend/`, [railway.json](railway.json), this Dockerfile, and managed Postgres. The public API is:
 
-- [Dockerfile](Dockerfile)
-- baseline Prisma migration in [backend/prisma/migrations](prisma/migrations)
-- Cloud Run deploy script at [scripts/deploy-backend-gcp.sh](../scripts/deploy-backend-gcp.sh)
-- Cloud Scheduler deploy script at [scripts/deploy-scheduler-gcp.sh](../scripts/deploy-scheduler-gcp.sh)
+- `https://backend-production-15d8.up.railway.app`
 
 Expected production shape:
 
-- Cloud Run hosts the public API
-- Cloud SQL Postgres stores canonical state
-- Secret Manager stores `DATABASE_URL`, Google OAuth credentials, and the encryption key
-- Cloud Scheduler hits `POST /internal/cron/sync` every minute with an OIDC token
-- Manual and scheduled sync share a per-user Postgres lease, so overlapping jobs return `status: "already_running"` instead of projecting the same task twice
+- Railway hosts the Fastify API and runs additive Prisma migrations before startup
+- Railway managed Postgres stores users, sessions, notes, OAuth state, event replay, projection jobs, and leases
+- Railway encrypted variables store `DATABASE_URL`, Google OAuth credentials, and the encryption key
+- the in-process completion-based loop runs background sync; `POST /internal/cron/sync` remains available for an optional external scheduler
+- manual and scheduled sync share a renewable per-user Postgres lease, so overlapping jobs return `status: "already_running"`
+- `/healthz` verifies database readiness and returns `APP_RELEASE_SHA` so a deployment can be tied to an exact Git commit
+
+The GCP files under `../infra/gcp/` are optional migration references only. The GitHub workflow runs CI and does not deploy either GCP or Railway.
 
 The internal cron endpoint verifies the Google-issued identity token against:
 
@@ -102,6 +105,7 @@ The internal cron endpoint verifies the Google-issued identity token against:
 cd backend
 npm install
 npm run build
+npm test
 npm run start
 ```
 

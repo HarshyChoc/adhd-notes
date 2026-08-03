@@ -13,17 +13,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        GlobalHotKeyManager.shared.unregisterHotKey()
+        GlobalHotKeyManager.shared.stop()
         coordinator.isQuitting = true
         coordinator.saveLastActiveNote()
         coordinator.saveAllNotesImmediately()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        GlobalHotKeyManager.shared.onCreateNote = { [weak coordinator] in
+            coordinator?.createNewNote()
+        }
         GlobalHotKeyManager.shared.onToggleVisibility = { [weak coordinator] in
             coordinator?.toggleAllNotesVisibilityFromGlobalHotKey()
         }
-        GlobalHotKeyManager.shared.registerDefaultHotKey()
+        GlobalHotKeyManager.shared.start()
         coordinator.restoreLastActiveNote()
         coordinator.startServices()
     }
@@ -74,10 +77,9 @@ struct MenuBarCommands: Scene {
         .commands {
             // File menu
             CommandGroup(replacing: .newItem) {
-                Button("New Note") {
+                Button("New Note (⌃⌥)") {
                     coordinator.createNewNote()
                 }
-                .keyboardShortcut("2", modifiers: .command)
 
                 Divider()
 
@@ -89,10 +91,9 @@ struct MenuBarCommands: Scene {
                     coordinator.hideAllNotes()
                 }
 
-                Button("Toggle Notes Visibility") {
+                Button("Toggle Notes Visibility (⌥⌘)") {
                     coordinator.toggleAllNotesVisibility()
                 }
-                .keyboardShortcut("1", modifiers: .command)
 
                 Divider()
 

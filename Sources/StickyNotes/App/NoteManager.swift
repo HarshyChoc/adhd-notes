@@ -119,6 +119,9 @@ final class NoteManager: ObservableObject {
     @discardableResult
     func updateNoteTaskList(_ noteId: UUID, taskListId: String?, taskListNameCache: String?) -> Note? {
         guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return nil }
+        if notes[index].serverVersion > 0, taskListId == nil {
+            return nil
+        }
         notes[index].taskListId = taskListId
         notes[index].taskListNameCache = taskListNameCache
         notes[index].syncState = taskListId == nil ? .localOnly : .pending
@@ -164,6 +167,15 @@ final class NoteManager: ObservableObject {
     func applyServerNote(_ serverNote: ServerNoteDTO) -> Note? {
         let id = UUID(uuidString: serverNote.id) ?? UUID()
         if let index = notes.firstIndex(where: { $0.id == id }) {
+            guard serverNote.serverVersion >= notes[index].serverVersion else { return nil }
+            if serverNote.serverVersion == notes[index].serverVersion {
+                notes[index].syncState = serverNote.pendingProjection
+                    ? (serverNote.lastProjectionError == nil ? .pending : .error)
+                    : .synced
+                notes[index].deletionReason = serverNote.lastProjectionError
+                persistenceManager.saveNote(notes[index])
+                return nil
+            }
             notes[index].content = serverNote.bodyMarkdown
             notes[index].taskListId = serverNote.taskListId
             notes[index].taskListNameCache = serverNote.taskListNameCache
@@ -202,6 +214,36 @@ final class NoteManager: ObservableObject {
         guard let id = UUID(uuidString: noteIdString) else { return }
         persistenceManager.tombstoneNote(id, reason: reason, syncState: .synced)
         notes.removeAll { $0.id == id }
+    }
+
+    func applyServerDeletion(_ tombstone: ServerDeletePayload) {
+        guard let id = UUID(uuidString: tombstone.noteId) else { return }
+        if let note = getNote(id), tombstone.serverVersion < note.serverVersion {
+            return
+        }
+        persistenceManager.tombstoneNote(
+            id,
+            reason: tombstone.deletionReason,
+            syncState: .synced,
+            serverVersion: tombstone.serverVersion,
+            serverUpdatedAt: tombstone.serverUpdatedAt,
+            deletedAt: tombstone.serverUpdatedAt
+        )
+        notes.removeAll { $0.id == id }
+    }
+
+    func acknowledgeServerVersion(
+        noteIdString: String,
+        serverVersion: Int,
+        serverUpdatedAt: Date?,
+        stillPending: Bool
+    ) {
+        guard let id = UUID(uuidString: noteIdString),
+              let index = notes.firstIndex(where: { $0.id == id }) else { return }
+        notes[index].serverVersion = max(notes[index].serverVersion, serverVersion)
+        notes[index].serverUpdatedAt = serverUpdatedAt ?? notes[index].serverUpdatedAt
+        notes[index].syncState = stillPending ? .pending : .synced
+        persistenceManager.saveNote(notes[index])
     }
 
     func deleteNote(_ noteId: UUID, reason: String = "desktop_delete") {

@@ -1,4 +1,5 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import rateLimit from "@fastify/rate-limit";
 import { google } from "googleapis";
 import { z } from "zod";
 
@@ -8,6 +9,7 @@ import { encrypt, randomToken, sha256 } from "./lib/crypto.js";
 import { MOCK_TASK_LISTS } from "./mock.js";
 import { sseHub } from "./lib/sse.js";
 import { SyncService } from "./services/sync-service.js";
+import { claimOAuthState, createOAuthState } from "./services/oauth-state-service.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -15,19 +17,27 @@ declare module "fastify" {
   }
 }
 
-const mutationSchema = z.object({
-  id: z.string().min(1),
-  type: z.enum([
-    "create_note",
-    "update_note_body",
-    "update_note_title",
-    "move_note_list",
-    "set_note_due_date",
-    "delete_note",
-  ]),
-  noteId: z.string().min(1),
-  payload: z.record(z.string().nullable()),
+const mutationBaseSchema = z.object({
+  id: z.string().uuid(),
+  noteId: z.string().uuid(),
+  baseServerVersion: z.number().int().nonnegative(),
 });
+
+const mutationSchema = z.discriminatedUnion("type", [
+  mutationBaseSchema.extend({
+    type: z.literal("upsert_note"),
+    payload: z.object({
+      content: z.string().max(1_000_000),
+      taskListId: z.string().min(1).max(4096),
+      taskListNameCache: z.string().max(4096).nullable(),
+      dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+    }),
+  }),
+  mutationBaseSchema.extend({
+    type: z.literal("delete_note"),
+    payload: z.object({}).strict(),
+  }),
+]);
 
 const preferencesSchema = z.object({
   selectedTaskListIds: z.array(z.string().min(1)),
@@ -157,8 +167,61 @@ function sendDesktopRedirectPage(reply: FastifyReply, desktopRedirectURL: string
 export async function buildApp() {
   const app = Fastify({ logger: true });
   const syncService = new SyncService(app.log);
+  let backgroundSyncTimer: NodeJS.Timeout | undefined;
+  let isClosing = false;
+
+  await app.register(rateLimit, {
+    global: true,
+    max: 300,
+    timeWindow: "1 minute",
+  });
+
+  app.addHook("onRequest", async (_request, reply) => {
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("X-Frame-Options", "DENY");
+    reply.header("Referrer-Policy", "no-referrer");
+    reply.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    );
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    const candidate = error as { statusCode?: unknown; message?: unknown };
+    const statusCode = error instanceof z.ZodError
+      ? 400
+      : typeof candidate.statusCode === "number" ? candidate.statusCode : 500;
+    if (statusCode >= 500) {
+      request.log.error({ err: error }, "Unhandled request error.");
+    }
+    reply.code(statusCode).send({
+      error: statusCode >= 500
+        ? "An internal error occurred."
+        : typeof candidate.message === "string" ? candidate.message : "Invalid request.",
+    });
+  });
+
+  const scheduleBackgroundSync = () => {
+    if (isClosing) return;
+    backgroundSyncTimer = setTimeout(async () => {
+      try {
+        await syncService.runScheduledSync();
+      } catch (error) {
+        app.log.error({ err: error }, "Background sync loop failed.");
+      } finally {
+        scheduleBackgroundSync();
+      }
+    }, config.GOOGLE_SYNC_INTERVAL_MS);
+    backgroundSyncTimer.unref();
+  };
+
+  app.addHook("onReady", async () => {
+    scheduleBackgroundSync();
+  });
 
   app.addHook("onClose", async () => {
+    isClosing = true;
+    if (backgroundSyncTimer) clearTimeout(backgroundSyncTimer);
     await prisma.$disconnect();
   });
 
@@ -234,11 +297,25 @@ export async function buildApp() {
     }
   }
 
-  app.get("/healthz", async () => ({
-    ok: true,
-    provider: config.SYNC_PROVIDER,
-    mockTaskLists: config.SYNC_PROVIDER === "mock" ? MOCK_TASK_LISTS.length : 0,
-  }));
+  app.get("/healthz", async (_request, reply) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      return {
+        ok: true,
+        database: "ok",
+        releaseSha: config.APP_RELEASE_SHA,
+        provider: config.SYNC_PROVIDER,
+        mockTaskLists: config.SYNC_PROVIDER === "mock" ? MOCK_TASK_LISTS.length : 0,
+      };
+    } catch (error) {
+      app.log.error({ err: error }, "Database readiness check failed.");
+      return reply.code(503).send({
+        ok: false,
+        database: "unavailable",
+        releaseSha: config.APP_RELEASE_SHA,
+      });
+    }
+  });
 
   app.get("/auth/google/start", async (request, reply) => {
     const query = z.object({
@@ -259,12 +336,7 @@ export async function buildApp() {
       return;
     }
 
-    const statePayload = JSON.stringify({
-      desktopRedirectUri,
-      nonce: randomToken(12),
-      issuedAt: Date.now(),
-    });
-    const state = Buffer.from(statePayload, "utf8").toString("base64url");
+    const state = await createOAuthState(desktopRedirectUri);
     const oauth2 = new google.auth.OAuth2(
       config.GOOGLE_CLIENT_ID,
       config.GOOGLE_CLIENT_SECRET,
@@ -291,24 +363,18 @@ export async function buildApp() {
       error: z.string().optional(),
     }).parse(request.query);
 
-    if (query.error) {
-      return reply.code(400).send({ error: query.error });
-    }
-    if (!query.code || !query.state) {
+    if (!query.state) {
       return reply.code(400).send({ error: "Missing OAuth callback parameters." });
     }
-
-    const stateJson = Buffer.from(query.state, "base64url").toString("utf8");
-    const state = z.object({
-      desktopRedirectUri: z.string(),
-      nonce: z.string(),
-      issuedAt: z.number(),
-    }).parse(JSON.parse(stateJson));
-    if (!isAllowedDesktopRedirectUri(state.desktopRedirectUri)) {
-      throw httpError(400, "Unrecognized desktop redirect URI.");
+    const oauthState = await claimOAuthState(query.state);
+    if (query.error) {
+      return reply.code(400).send({ error: "Google sign-in was cancelled or denied." });
     }
-    if (Date.now() - state.issuedAt > 10 * 60_000) {
-      throw httpError(400, "OAuth state has expired.");
+    if (!query.code) {
+      return reply.code(400).send({ error: "Missing OAuth callback parameters." });
+    }
+    if (!isAllowedDesktopRedirectUri(oauthState.desktopRedirectUri)) {
+      throw httpError(400, "Unrecognized desktop redirect URI.");
     }
 
     const oauth2 = new google.auth.OAuth2(
@@ -377,11 +443,15 @@ export async function buildApp() {
       },
     });
 
-    const rawAuthCode = await issueDesktopAuthCode(user.id, state.desktopRedirectUri);
+    await prisma.oAuthState.update({
+      where: { id: oauthState.id },
+      data: { userId: user.id },
+    });
+    const rawAuthCode = await issueDesktopAuthCode(user.id, oauthState.desktopRedirectUri);
 
     return sendDesktopRedirectPage(
       reply,
-      `${desktopRedirectTarget(state.desktopRedirectUri)}auth_code=${encodeURIComponent(rawAuthCode)}`,
+      `${desktopRedirectTarget(oauthState.desktopRedirectUri)}auth_code=${encodeURIComponent(rawAuthCode)}`,
     );
   });
 
@@ -398,17 +468,25 @@ export async function buildApp() {
     }
 
     const rawSessionToken = randomToken();
-    const session = await prisma.appSession.create({
-      data: {
-        userId: authCode.userId,
-        tokenHash: sha256(rawSessionToken),
-        expiresAt: new Date(Date.now() + config.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000),
-      },
-    });
-
-    await prisma.appAuthCode.update({
-      where: { id: authCode.id },
-      data: { usedAt: new Date() },
+    const session = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.appAuthCode.updateMany({
+        where: {
+          id: authCode.id,
+          usedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+        data: { usedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw httpError(401, "Auth code is invalid or expired.");
+      }
+      return tx.appSession.create({
+        data: {
+          userId: authCode.userId,
+          tokenHash: sha256(rawSessionToken),
+          expiresAt: new Date(Date.now() + config.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000),
+        },
+      });
     });
 
     return {
@@ -464,40 +542,65 @@ export async function buildApp() {
     reply.raw.setHeader("Cache-Control", "no-cache");
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.flushHeaders();
+    reply.hijack();
 
-    if (query.since) {
-      const historical = await prisma.eventLog.findMany({
-        where: {
-          userId,
-          sequence: { gt: query.since },
-        },
-        orderBy: { sequence: "asc" },
+    let cursor = query.since ?? 0;
+    let isClosed = false;
+    let flushPromise: Promise<void> | null = null;
+
+    const flushEvents = () => {
+      if (isClosed) return Promise.resolve();
+      if (flushPromise) return flushPromise;
+
+      flushPromise = (async () => {
+        while (!isClosed) {
+          const events = await prisma.eventLog.findMany({
+            where: {
+              userId,
+              sequence: { gt: cursor },
+            },
+            orderBy: { sequence: "asc" },
+            take: 500,
+          });
+          for (const event of events) {
+            if (isClosed) return;
+            reply.raw.write(`event: ${event.type}\n`);
+            reply.raw.write(`data: ${JSON.stringify({
+              sequence: event.sequence,
+              type: event.type,
+              payload: event.payload,
+            })}\n\n`);
+            cursor = event.sequence;
+          }
+          if (events.length < 500) return;
+        }
+      })().finally(() => {
+        flushPromise = null;
       });
-      for (const event of historical) {
-        reply.raw.write(`event: ${event.type}\n`);
-        reply.raw.write(`data: ${JSON.stringify({
-          sequence: event.sequence,
-          type: event.type,
-          payload: event.payload,
-        })}\n\n`);
-      }
-    }
+      return flushPromise;
+    };
 
-    const unsubscribe = sseHub.subscribe(userId, (event) => {
-      reply.raw.write(`event: ${event.type}\n`);
-      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    await flushEvents();
+
+    // The emitter gives same-instance low latency. Database polling is the source
+    // of truth and delivers events produced by any Railway replica.
+    const unsubscribe = sseHub.subscribe(userId, () => {
+      void flushEvents();
     });
+    const poller = setInterval(() => {
+      void flushEvents();
+    }, 1_000);
 
     const heartbeat = setInterval(() => {
       reply.raw.write(": keep-alive\n\n");
     }, 15_000);
 
     request.raw.on("close", () => {
+      isClosed = true;
       clearInterval(heartbeat);
+      clearInterval(poller);
       unsubscribe();
     });
-
-    return reply;
   });
 
   return app;

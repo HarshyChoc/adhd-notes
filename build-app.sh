@@ -1,6 +1,7 @@
 #!/bin/bash
 
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "Build failed at line %s.\n" "$LINENO" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="StickyNotes"
@@ -16,13 +17,8 @@ SKIP_DMG="${SKIP_DMG:-0}"
 SKIP_ZIP="${SKIP_ZIP:-0}"
 
 default_version() {
-  local git_tag
-  git_tag="$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
-  if [[ -n "$git_tag" ]]; then
-    printf "%s" "${git_tag#v}"
-  else
-    printf "1.0.0"
-  fi
+  /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ROOT_DIR/Sources/StickyNotes/Info.plist" 2>/dev/null \
+    || printf "1.2.0"
 }
 
 default_build_number() {
@@ -78,6 +74,9 @@ prepare_bundle() {
   plutil -replace CFBundleVersion -string "$APP_BUILD" "$INFO_PLIST"
   plutil -replace NSHumanReadableCopyright -string "$APP_COPYRIGHT" "$INFO_PLIST"
 
+  [[ "$(plutil -extract CFBundleShortVersionString raw "$INFO_PLIST")" == "$APP_VERSION" ]]
+  [[ "$(plutil -extract CFBundleVersion raw "$INFO_PLIST")" == "$APP_BUILD" ]]
+
   log "App bundle assembled at $APP_DIR"
 }
 
@@ -91,6 +90,8 @@ sign_app() {
       --timestamp \
       --sign "$APPLE_DEVELOPER_IDENTITY" \
       "$APP_DIR"
+    codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+    codesign -d --verbose=2 "$APP_DIR" 2>&1 | grep -F "Authority=$APPLE_DEVELOPER_IDENTITY"
     log "App signed with Developer ID identity."
     return
   fi
@@ -101,6 +102,7 @@ sign_app() {
   fi
 
   codesign --force --deep --sign - "$APP_DIR"
+  codesign --verify --deep --strict --verbose=2 "$APP_DIR"
   log "App signed ad-hoc for local development."
 }
 
@@ -182,12 +184,11 @@ create_dmg() {
   log "DMG created at $DMG_PATH"
 }
 
-notarize_path() {
+submit_notarization() {
   local target_path="$1"
   log "Submitting $target_path for notarization..."
   xcrun notarytool submit "$target_path" --keychain-profile "$APPLE_NOTARY_PROFILE" --wait
-  xcrun stapler staple "$target_path"
-  log "Notarized and stapled $target_path"
+  log "Notarization accepted for $target_path"
 }
 
 notarize_app_bundle() {
@@ -198,8 +199,9 @@ notarize_app_bundle() {
   local notarize_zip="$ROOT_DIR/build/MDStickyNotes-notary.zip"
   rm -f "$notarize_zip"
   ditto -c -k --keepParent "$APP_DIR" "$notarize_zip"
-  notarize_path "$notarize_zip"
+  submit_notarization "$notarize_zip"
   xcrun stapler staple "$APP_DIR"
+  xcrun stapler validate "$APP_DIR"
   rm -f "$notarize_zip"
 }
 
@@ -208,7 +210,9 @@ notarize_dmg_artifact() {
     return
   fi
   if [[ "$SKIP_DMG" != "1" && "$NOTARIZE_DMG" == "1" ]]; then
-    notarize_path "$DMG_PATH"
+    submit_notarization "$DMG_PATH"
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
   fi
 }
 

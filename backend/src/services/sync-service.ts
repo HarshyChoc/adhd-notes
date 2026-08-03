@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
-import { Prisma, type GoogleAccount, type Note } from "@prisma/client";
+import { Prisma, type GoogleAccount, type Note, type TaskListSubscription } from "@prisma/client";
 
 import { config } from "../config.js";
 import { prisma } from "../db.js";
@@ -12,27 +12,45 @@ import {
   moveTaskBetweenLists,
   deleteTask,
   getTaskIfExists,
+  type RemoteTaskSnapshot,
 } from "../lib/google.js";
-import { plainTaskToMarkdown } from "../lib/markdown.js";
+import {
+  deriveNoteContentParts,
+  plainTaskToMarkdown,
+  projectedTaskFingerprint,
+} from "../lib/markdown.js";
 import { MOCK_TASK_LISTS } from "../mock.js";
 import { sseHub } from "../lib/sse.js";
 import type { NoteDto, TaskListDto } from "../types.js";
 
 type MutationEnvelope = {
   id: string;
-  type:
-    | "create_note"
-    | "update_note_body"
-    | "update_note_title"
-    | "move_note_list"
-    | "set_note_due_date"
-    | "delete_note";
+  type: "upsert_note" | "delete_note";
   noteId: string;
+  baseServerVersion: number;
   payload: Record<string, string | null>;
+};
+
+type MutationResult = {
+  id: string;
+  status: "applied" | "duplicate" | "conflict";
+  note: NoteDto | null;
+  tombstone: ReturnType<typeof noteToTombstone> | null;
+};
+
+type MutationTransactionResult = {
+  result: MutationResult;
+  event: { sequence: number; type: string; payload: Prisma.JsonValue } | null;
 };
 
 function serviceError(statusCode: number, message: string) {
   return Object.assign(new Error(message), { statusCode });
+}
+
+function mutationRaceError() {
+  return Object.assign(new Error("The note changed while the mutation was being applied."), {
+    mutationRace: true,
+  });
 }
 
 function noteToDto(note: Note): NoteDto {
@@ -51,6 +69,15 @@ function noteToDto(note: Note): NoteDto {
     deletionReason: note.deletionReason ?? null,
     pendingProjection: note.pendingProjection,
     lastProjectionError: note.lastProjectionError ?? null,
+  };
+}
+
+function noteToTombstone(note: Note) {
+  return {
+    noteId: note.id,
+    deletionReason: note.deletionReason ?? "deleted",
+    serverVersion: note.serverVersion,
+    serverUpdatedAt: note.serverUpdatedAt.toISOString(),
   };
 }
 
@@ -108,8 +135,13 @@ function isGoogleTaskNotFoundError(error: unknown) {
   return statusCode === 404 || candidate.message?.includes("Requested entity was not found.") === true;
 }
 
-async function upsertProjectionJob(userId: string, noteId: string, operation: string) {
-  const existing = await prisma.projectionJob.findUnique({
+async function upsertProjectionJob(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  noteId: string,
+  operation: string,
+) {
+  const existing = await tx.projectionJob.findUnique({
     where: {
       userId_noteId: {
         userId,
@@ -123,7 +155,7 @@ async function upsertProjectionJob(userId: string, noteId: string, operation: st
   });
 
   if (!existing) {
-    await prisma.projectionJob.create({
+    await tx.projectionJob.create({
       data: {
         userId,
         noteId,
@@ -133,18 +165,28 @@ async function upsertProjectionJob(userId: string, noteId: string, operation: st
     return;
   }
 
-  await prisma.projectionJob.update({
+  await tx.projectionJob.update({
     where: { id: existing.id },
     data: {
       operation: mergeProjectionOperation(existing.operation, operation),
       runAfter: new Date(),
       lastError: null,
+      generation: { increment: 1 },
     },
   });
 }
 
 function asString(payload: MutationEnvelope["payload"], key: string): string | null {
   return payload[key] ?? null;
+}
+
+export function isProjectedTaskEcho(
+  remoteFingerprint: string,
+  lastProjectedFingerprint: string | null,
+  canonicalLocalFingerprint: string | null,
+) {
+  return remoteFingerprint === lastProjectedFingerprint
+    || (!lastProjectedFingerprint && remoteFingerprint === canonicalLocalFingerprint);
 }
 
 export class SyncService {
@@ -300,7 +342,6 @@ export class SyncService {
         userId,
         deletedAt: { not: null },
       },
-      select: { id: true },
     });
     const latestEvent = await prisma.eventLog.findFirst({
       where: { userId },
@@ -316,6 +357,7 @@ export class SyncService {
         isDefault: list.isDefault,
       })),
       deletedNoteIds: deletedNotes.map((note) => note.id),
+      tombstones: deletedNotes.map(noteToTombstone),
       latestSequence: latestEvent?.sequence ?? 0,
     };
   }
@@ -338,19 +380,25 @@ export class SyncService {
     let skippedUsers = 0;
     let failedUsers = 0;
 
-    for (const user of users) {
-      try {
-        const result = await this.runSyncNow(user.id);
-        if (result.status === "already_running") {
-          skippedUsers += 1;
-        } else {
-          syncedUsers += 1;
+    let nextUserIndex = 0;
+    const workerCount = Math.min(config.SCHEDULED_SYNC_CONCURRENCY, Math.max(users.length, 1));
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (nextUserIndex < users.length) {
+        const user = users[nextUserIndex++];
+        if (!user) continue;
+        try {
+          const result = await this.runSyncNow(user.id);
+          if (result.status === "already_running") {
+            skippedUsers += 1;
+          } else {
+            syncedUsers += 1;
+          }
+        } catch (error) {
+          failedUsers += 1;
+          this.logger.error({ err: error, userId: user.id }, "Scheduled sync failed for user.");
         }
-      } catch (error) {
-        failedUsers += 1;
-        this.logger.error({ err: error, userId: user.id }, "Scheduled sync failed for user.");
       }
-    }
+    }));
 
     return {
       syncedUsers,
@@ -373,28 +421,40 @@ export class SyncService {
     deletionReason: "google_deleted" | "google_completed",
     serverUpdatedAt: Date,
   ) {
-    const deleted = await prisma.note.update({
-      where: { id: note.id },
-      data: {
-        deletedAt: new Date(),
-        deletionReason,
-        pendingProjection: false,
-        lastProjectionError: null,
-        serverVersion: { increment: 1 },
-        serverUpdatedAt,
-      },
+    const result = await prisma.$transaction(async (tx) => {
+      const deleted = await tx.note.update({
+        where: { id: note.id },
+        data: {
+          deletedAt: new Date(),
+          deletionReason,
+          pendingProjection: false,
+          lastProjectionError: null,
+          serverVersion: { increment: 1 },
+          serverUpdatedAt,
+        },
+      });
+      await tx.projectionJob.deleteMany({
+        where: {
+          userId: note.userId,
+          noteId: note.id,
+        },
+      });
+      const event = await tx.eventLog.create({
+        data: {
+          userId: note.userId,
+          type: "note.delete",
+          noteId: deleted.id,
+          payload: noteToTombstone(deleted),
+        },
+      });
+      return { deleted, event };
     });
-    await prisma.projectionJob.deleteMany({
-      where: {
-        userId: note.userId,
-        noteId: note.id,
-      },
+    sseHub.publish(note.userId, {
+      sequence: result.event.sequence,
+      type: result.event.type,
+      payload: result.event.payload,
     });
-    await appendEvent(note.userId, "note.delete", deleted.id, {
-      noteId: deleted.id,
-      deletionReason,
-    });
-    return deleted;
+    return result.deleted;
   }
 
   private async findOwnedNote(userId: string, noteId: string) {
@@ -498,153 +558,222 @@ export class SyncService {
 
   async applyMutations(userId: string, mutations: MutationEnvelope[]) {
     let latestSequence = 0;
+    const results: MutationResult[] = [];
 
     for (const mutation of mutations) {
-      const alreadyApplied = await prisma.appliedMutation.findFirst({
-        where: {
-          id: mutation.id,
-          userId,
-        },
+      const alreadyApplied = await prisma.appliedMutation.findUnique({
+        where: { id: mutation.id },
       });
       if (alreadyApplied) {
+        if (alreadyApplied.userId !== userId) {
+          throw serviceError(403, "This mutation id belongs to another user.");
+        }
+        const existing = await this.findOwnedNote(userId, mutation.noteId);
+        results.push({
+          id: mutation.id,
+          status: "duplicate",
+          note: existing && !existing.deletedAt ? noteToDto(existing) : null,
+          tombstone: existing?.deletedAt ? noteToTombstone(existing) : null,
+        });
         continue;
       }
 
-      let note = await this.assertNoteOwnershipAvailable(userId, mutation.noteId);
+      let transactionResult: MutationTransactionResult;
+      try {
+        transactionResult = await prisma.$transaction(async (tx) => {
+        const existing = await tx.note.findUnique({ where: { id: mutation.noteId } });
+        if (existing && existing.userId !== userId) {
+          throw serviceError(403, "This note does not belong to the authenticated user.");
+        }
 
-      const taskListId = asString(mutation.payload, "taskListId");
-      const taskListNameCache = asString(mutation.payload, "taskListNameCache");
-      const bodyMarkdown = asString(mutation.payload, "content");
-      const dueDate = asString(mutation.payload, "dueDate");
-      const now = new Date();
+        if (existing && existing.serverVersion !== mutation.baseServerVersion) {
+          return {
+            result: {
+              id: mutation.id,
+              status: "conflict" as const,
+              note: existing.deletedAt ? null : noteToDto(existing),
+              tombstone: existing.deletedAt ? noteToTombstone(existing) : null,
+            },
+            event: null,
+          };
+        }
+        if (!existing && mutation.baseServerVersion !== 0) {
+          return {
+            result: {
+              id: mutation.id,
+              status: "conflict" as const,
+              note: null,
+              tombstone: null,
+            },
+            event: null,
+          };
+        }
 
-      switch (mutation.type) {
-      case "create_note":
-      case "update_note_body":
-      case "update_note_title": {
-        const content = bodyMarkdown ?? note?.bodyMarkdown ?? "";
-        const { deriveNoteContentParts } = await import("../lib/markdown.js");
-        const parts = deriveNoteContentParts(content);
-        if (note) {
-          note = await prisma.note.update({
-            where: { id: note.id },
+        const now = new Date();
+        let updatedNote: Note | null = null;
+        let eventType: "note.upsert" | "note.delete" | null = null;
+        let eventPayload: Prisma.JsonObject | null = null;
+
+        if (mutation.type === "upsert_note") {
+          const taskListId = asString(mutation.payload, "taskListId")?.trim() ?? "";
+          const content = asString(mutation.payload, "content") ?? "";
+          if (!taskListId) {
+            throw serviceError(400, "A synced note must be assigned to a task list.");
+          }
+          const taskListNameCache = asString(mutation.payload, "taskListNameCache");
+          const dueDate = asString(mutation.payload, "dueDate");
+          const parts = deriveNoteContentParts(content);
+          const previousTaskListId = existing?.googleTaskListId ?? null;
+
+          if (existing) {
+            const changed = await tx.note.updateMany({
+                where: {
+                  id: existing.id,
+                  userId,
+                  serverVersion: mutation.baseServerVersion,
+                },
+                data: {
+                  title: parts.title,
+                  bodyMarkdown: parts.bodyMarkdown,
+                  bodyPlaintext: parts.bodyPlaintext,
+                  googleTaskListId: taskListId,
+                  taskListNameCache,
+                  dueDate,
+                  deletedAt: null,
+                  deletionReason: null,
+                  pendingProjection: true,
+                  lastProjectionError: null,
+                  serverVersion: { increment: 1 },
+                  serverUpdatedAt: now,
+                },
+              });
+            if (changed.count !== 1) throw mutationRaceError();
+            updatedNote = await tx.note.findUniqueOrThrow({ where: { id: existing.id } });
+          } else {
+            updatedNote = await tx.note.create({
+                data: {
+                  id: mutation.noteId,
+                  userId,
+                  title: parts.title,
+                  bodyMarkdown: parts.bodyMarkdown,
+                  bodyPlaintext: parts.bodyPlaintext,
+                  googleTaskListId: taskListId,
+                  taskListNameCache,
+                  dueDate,
+                  serverUpdatedAt: now,
+                  pendingProjection: true,
+                },
+              });
+          }
+
+          const operation = previousTaskListId && previousTaskListId !== taskListId
+            ? `move:${previousTaskListId}`
+            : updatedNote.googleTaskId ? "upsert" : "create";
+          await upsertProjectionJob(tx, userId, updatedNote.id, operation);
+          eventType = "note.upsert";
+          eventPayload = { note: noteToDto(updatedNote) } as unknown as Prisma.JsonObject;
+        } else if (existing) {
+          const changed = await tx.note.updateMany({
+            where: {
+              id: existing.id,
+              userId,
+              serverVersion: mutation.baseServerVersion,
+            },
             data: {
-              title: parts.title,
-              bodyMarkdown: content,
-              bodyPlaintext: parts.bodyPlaintext,
-              googleTaskListId: taskListId ?? note.googleTaskListId ?? undefined,
-              taskListNameCache: taskListNameCache ?? note.taskListNameCache ?? undefined,
-              dueDate: dueDate ?? note.dueDate ?? undefined,
-              deletedAt: null,
-              deletionReason: null,
+              deletedAt: now,
+              deletionReason: "desktop_delete",
               pendingProjection: true,
               lastProjectionError: null,
               serverVersion: { increment: 1 },
               serverUpdatedAt: now,
             },
           });
-        } else {
-          note = await prisma.note.create({
+          if (changed.count !== 1) throw mutationRaceError();
+          updatedNote = await tx.note.findUniqueOrThrow({ where: { id: existing.id } });
+          await upsertProjectionJob(tx, userId, updatedNote.id, "delete");
+          eventType = "note.delete";
+          eventPayload = noteToTombstone(updatedNote);
+        }
+
+        await tx.appliedMutation.create({
+          data: {
+            id: mutation.id,
+            userId,
+            noteId: mutation.noteId,
+            type: mutation.type,
+            payload: {
+              ...mutation.payload,
+              baseServerVersion: mutation.baseServerVersion,
+            },
+          },
+        });
+
+        let event: { sequence: number; type: string; payload: Prisma.JsonValue } | null = null;
+        if (eventType && eventPayload) {
+          const created = await tx.eventLog.create({
             data: {
-              id: mutation.noteId,
               userId,
-              title: parts.title,
-              bodyMarkdown: content,
-              bodyPlaintext: parts.bodyPlaintext,
-              googleTaskListId: taskListId ?? undefined,
-              taskListNameCache: taskListNameCache ?? undefined,
-              dueDate: dueDate ?? undefined,
-              serverUpdatedAt: now,
-              pendingProjection: true,
+              type: eventType,
+              noteId: mutation.noteId,
+              payload: eventPayload,
             },
           });
+          event = { sequence: created.sequence, type: eventType, payload: created.payload };
         }
-        await upsertProjectionJob(userId, note.id, note.googleTaskId ? "upsert" : "create");
-        latestSequence = await appendEvent(userId, "note.upsert", note.id, {
-          note: noteToDto(note),
-        });
-        break;
-      }
-      case "move_note_list": {
-        const existingNote = await this.loadOwnedNoteOrThrow(userId, mutation.noteId);
-        const previousTaskListId = existingNote.googleTaskListId;
-        note = await prisma.note.update({
-          where: { id: existingNote.id },
-          data: {
-            googleTaskListId: taskListId,
-            taskListNameCache,
-            pendingProjection: true,
-            lastProjectionError: null,
-            serverVersion: { increment: 1 },
-            serverUpdatedAt: now,
+
+        return {
+          result: {
+            id: mutation.id,
+            status: "applied" as const,
+            note: updatedNote && !updatedNote.deletedAt ? noteToDto(updatedNote) : null,
+            tombstone: updatedNote?.deletedAt ? noteToTombstone(updatedNote) : null,
           },
+          event,
+        };
         });
-        await upsertProjectionJob(
-          userId,
-          note.id,
-          previousTaskListId ? `move:${previousTaskListId}` : "upsert",
-        );
-        latestSequence = await appendEvent(userId, "note.upsert", note.id, {
-          note: noteToDto(note),
-        });
-        break;
-      }
-      case "set_note_due_date": {
-        const existingNote = await this.loadOwnedNoteOrThrow(userId, mutation.noteId);
-        note = await prisma.note.update({
-          where: { id: existingNote.id },
-          data: {
-            dueDate,
-            pendingProjection: true,
-            lastProjectionError: null,
-            serverVersion: { increment: 1 },
-            serverUpdatedAt: now,
-          },
-        });
-        await upsertProjectionJob(userId, note.id, "upsert");
-        latestSequence = await appendEvent(userId, "note.upsert", note.id, {
-          note: noteToDto(note),
-        });
-        break;
-      }
-      case "delete_note": {
-        const existingNote = await this.assertNoteOwnershipAvailable(userId, mutation.noteId);
-        if (!existingNote) {
-          break;
+      } catch (error) {
+        const candidate = error as { mutationRace?: boolean };
+        const isUniqueRace = error instanceof Prisma.PrismaClientKnownRequestError
+          && error.code === "P2002";
+        if (!candidate.mutationRace && !isUniqueRace) throw error;
+
+        const applied = await prisma.appliedMutation.findUnique({ where: { id: mutation.id } });
+        if (applied) {
+          if (applied.userId !== userId) {
+            throw serviceError(403, "This mutation id belongs to another user.");
+          }
+          const canonical = await this.findOwnedNote(userId, mutation.noteId);
+          results.push({
+            id: mutation.id,
+            status: "duplicate",
+            note: canonical && !canonical.deletedAt ? noteToDto(canonical) : null,
+            tombstone: canonical?.deletedAt ? noteToTombstone(canonical) : null,
+          });
+          continue;
         }
-        const deletedNote = await prisma.note.update({
-          where: { id: existingNote.id },
-          data: {
-            deletedAt: now,
-            deletionReason: "desktop_delete",
-            pendingProjection: true,
-            lastProjectionError: null,
-            serverVersion: { increment: 1 },
-            serverUpdatedAt: now,
-          },
+
+        const canonical = await this.findOwnedNote(userId, mutation.noteId);
+        if (!canonical) throw error;
+        results.push({
+          id: mutation.id,
+          status: "conflict",
+          note: canonical.deletedAt ? null : noteToDto(canonical),
+          tombstone: canonical.deletedAt ? noteToTombstone(canonical) : null,
         });
-        note = deletedNote;
-        await upsertProjectionJob(userId, deletedNote.id, "delete");
-        latestSequence = await appendEvent(userId, "note.delete", deletedNote.id, {
-          noteId: deletedNote.id,
-          deletionReason: deletedNote.deletionReason ?? "desktop_delete",
-        });
-        break;
-      }
+        continue;
       }
 
-      await prisma.appliedMutation.create({
-        data: {
-          id: mutation.id,
-          userId,
-          noteId: mutation.noteId,
-          type: mutation.type,
-          payload: mutation.payload,
-        },
-      });
+      results.push(transactionResult.result);
+      if (transactionResult.event) {
+        latestSequence = Math.max(latestSequence, transactionResult.event.sequence);
+        sseHub.publish(userId, transactionResult.event);
+      }
     }
 
-    return { latestSequence };
+    if (latestSequence === 0) {
+      latestSequence = await this.latestSequenceForUser(userId);
+    }
+    return { latestSequence, results };
   }
 
   async syncNow(userId: string) {
@@ -662,8 +791,22 @@ export class SyncService {
       };
     }
 
+    let leaseLost = false;
+    const leaseHeartbeat = setInterval(() => {
+      void this.renewSyncLease(userId, ownerId)
+        .then((renewed) => {
+          if (!renewed) leaseLost = true;
+        })
+        .catch((error) => {
+          leaseLost = true;
+          this.logger.error({ err: error, userId }, "Failed to renew sync lease.");
+        });
+    }, 30_000);
+    leaseHeartbeat.unref();
+
     try {
       await this.pullRemoteChanges(userId);
+      if (leaseLost) throw serviceError(409, "The synchronization lease was lost.");
       await this.processProjectionJobs(userId);
       return {
         latestSequence: await this.latestSequenceForUser(userId),
@@ -671,23 +814,38 @@ export class SyncService {
         status: "completed" as const,
       };
     } finally {
+      clearInterval(leaseHeartbeat);
       await this.releaseSyncLease(userId, ownerId);
     }
   }
 
   private async acquireSyncLease(userId: string, ownerId: string) {
-    const expiresAt = new Date(Date.now() + 5 * 60_000);
-    const rows = await prisma.$queryRaw<Array<{ userId: string }>>`
-      INSERT INTO "UserSyncLease" ("id", "userId", "ownerId", "expiresAt", "createdAt", "updatedAt")
-      VALUES (${randomUUID()}, ${userId}, ${ownerId}, ${expiresAt}, NOW(), NOW())
-      ON CONFLICT ("userId") DO UPDATE
-      SET "ownerId" = EXCLUDED."ownerId",
-          "expiresAt" = EXCLUDED."expiresAt",
-          "updatedAt" = NOW()
-      WHERE "UserSyncLease"."expiresAt" < NOW()
-      RETURNING "userId"
-    `;
-    return rows.length === 1;
+    const expiresAt = new Date(Date.now() + 2 * 60_000);
+    const reclaimed = await prisma.userSyncLease.updateMany({
+      where: { userId, expiresAt: { lt: new Date() } },
+      data: { ownerId, expiresAt },
+    });
+    if (reclaimed.count === 1) return true;
+
+    try {
+      await prisma.userSyncLease.create({
+        data: { userId, ownerId, expiresAt },
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async renewSyncLease(userId: string, ownerId: string) {
+    const renewed = await prisma.userSyncLease.updateMany({
+      where: { userId, ownerId },
+      data: { expiresAt: new Date(Date.now() + 2 * 60_000) },
+    });
+    return renewed.count === 1;
   }
 
   private async releaseSyncLease(userId: string, ownerId: string) {
@@ -728,42 +886,66 @@ export class SyncService {
       }
 
       try {
-        await this.projectNoteToGoogle(googleAccount, note, job.operation);
-        const refreshed = await prisma.note.update({
-          where: { id: note.id },
-          data: {
-            pendingProjection: false,
-            lastProjectionError: null,
-          },
+        const outcome = await this.projectNoteToGoogle(googleAccount, note, job.operation);
+        if (outcome.remoteDeleted) {
+          await this.markNoteDeletedFromGoogle(note, "google_deleted", new Date());
+          continue;
+        }
+
+        const refreshed = await prisma.$transaction(async (tx) => {
+          const cleared = await tx.projectionJob.deleteMany({
+            where: { id: job.id, generation: job.generation },
+          });
+          const data: Prisma.NoteUpdateInput = {
+            googleTaskId: outcome.googleTaskId ?? undefined,
+            remoteEtag: outcome.etag ?? undefined,
+            lastProjectedFingerprint: outcome.fingerprint ?? undefined,
+          };
+          if (cleared.count === 1) {
+            data.pendingProjection = false;
+            data.lastProjectionError = null;
+          }
+          return tx.note.update({ where: { id: note.id }, data });
         });
-        await prisma.projectionJob.delete({ where: { id: job.id } });
-        if (!refreshed.deletedAt) {
+
+        if (!refreshed.deletedAt && !refreshed.pendingProjection) {
           await appendEvent(userId, "note.upsert", refreshed.id, {
             note: noteToDto(refreshed),
           });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown projection error";
-        await prisma.projectionJob.update({
-          where: { id: job.id },
+        const currentJob = await prisma.projectionJob.updateMany({
+          where: { id: job.id, generation: job.generation },
           data: {
             attemptCount: { increment: 1 },
             lastError: message,
             runAfter: new Date(Date.now() + 30_000),
           },
         });
-        await prisma.note.update({
-          where: { id: note.id },
-          data: {
-            pendingProjection: true,
-            lastProjectionError: message,
-          },
-        });
+        if (currentJob.count === 1) {
+          await prisma.note.update({
+            where: { id: note.id },
+            data: {
+              pendingProjection: true,
+              lastProjectionError: message,
+            },
+          });
+        }
       }
     }
   }
 
-  private async projectNoteToGoogle(googleAccount: GoogleAccount, note: Note, operation: string) {
+  private async projectNoteToGoogle(
+    googleAccount: GoogleAccount,
+    note: Note,
+    operation: string,
+  ): Promise<{
+    googleTaskId?: string;
+    etag?: string | null;
+    fingerprint?: string;
+    remoteDeleted?: boolean;
+  }> {
     if (note.deletedAt) {
       if (note.googleTaskId) {
         const remoteTaskListId = await this.findRemoteTaskListIdForTask(
@@ -776,12 +958,19 @@ export class SyncService {
           await deleteTask(googleAccount, remoteTaskListId, note.googleTaskId);
         }
       }
-      return;
+      return {};
     }
 
     if (!note.googleTaskListId) {
-      return;
+      throw serviceError(400, "A synced note must be assigned to a task list.");
     }
+
+    const fingerprint = projectedTaskFingerprint({
+      title: note.title,
+      notes: note.bodyPlaintext,
+      dueDate: note.dueDate,
+      taskListId: note.googleTaskListId,
+    });
 
     if (!note.googleTaskId) {
       const created = await createTask(
@@ -791,14 +980,11 @@ export class SyncService {
         note.bodyPlaintext,
         note.dueDate,
       );
-      await prisma.note.update({
-        where: { id: note.id },
-        data: {
-          googleTaskId: created.googleTaskId,
-          remoteEtag: created.etag,
-        },
-      });
-      return;
+      return {
+        googleTaskId: created.googleTaskId,
+        etag: created.etag,
+        fingerprint,
+      };
     }
 
     const previousTaskListId = operation.startsWith("move:")
@@ -838,13 +1024,7 @@ export class SyncService {
 
     try {
       const updated = await updateTask(googleAccount, note);
-      await prisma.note.update({
-        where: { id: note.id },
-        data: {
-          remoteEtag: updated.etag,
-        },
-      });
-      return;
+      return { etag: updated.etag, fingerprint };
     } catch (error) {
       if (!isGoogleTaskNotFoundError(error)) {
         throw error;
@@ -866,20 +1046,10 @@ export class SyncService {
         note.googleTaskListId,
       );
       const updated = await updateTask(googleAccount, note);
-      await prisma.note.update({
-        where: { id: note.id },
-        data: {
-          remoteEtag: updated.etag,
-        },
-      });
-      return;
+      return { etag: updated.etag, fingerprint };
     }
 
-    await this.markNoteDeletedFromGoogle(
-      note,
-      "google_deleted",
-      new Date(),
-    );
+    return { remoteDeleted: true };
   }
 
   private async processProjectionJobsMock(userId: string) {
@@ -899,21 +1069,150 @@ export class SyncService {
         continue;
       }
 
-      const refreshed = await prisma.note.update({
-        where: { id: note.id },
-        data: {
-          pendingProjection: false,
-          lastProjectionError: null,
-          googleTaskId: note.deletedAt ? note.googleTaskId : note.googleTaskId ?? `mock-task-${note.id}`,
-        },
+      const refreshed = await prisma.$transaction(async (tx) => {
+        const cleared = await tx.projectionJob.deleteMany({
+          where: { id: job.id, generation: job.generation },
+        });
+        return tx.note.update({
+          where: { id: note.id },
+          data: {
+            pendingProjection: cleared.count === 1 ? false : note.pendingProjection,
+            lastProjectionError: cleared.count === 1 ? null : note.lastProjectionError,
+            googleTaskId: note.deletedAt ? note.googleTaskId : note.googleTaskId ?? `mock-task-${note.id}`,
+            lastProjectedFingerprint: note.googleTaskListId
+              ? projectedTaskFingerprint({
+                  title: note.title,
+                  notes: note.bodyPlaintext,
+                  dueDate: note.dueDate,
+                  taskListId: note.googleTaskListId,
+                })
+              : undefined,
+          },
+        });
       });
-      await prisma.projectionJob.delete({ where: { id: job.id } });
-      if (!refreshed.deletedAt) {
+      if (!refreshed.deletedAt && !refreshed.pendingProjection) {
         await appendEvent(userId, "note.upsert", refreshed.id, {
           note: noteToDto(refreshed),
         });
       }
     }
+  }
+
+  async reconcileRemoteTask(
+    userId: string,
+    subscription: Pick<TaskListSubscription, "googleTaskListId" | "title">,
+    remote: RemoteTaskSnapshot,
+  ): Promise<"echo" | "changed" | "deleted" | "ignored"> {
+    const existing = await this.findOwnedNoteByGoogleTaskId(
+      userId,
+      remote.id,
+      subscription.googleTaskListId,
+    );
+
+    if (remote.deleted || remote.completed) {
+      if (existing && !existing.deletedAt) {
+        await this.markNoteDeletedFromGoogle(
+          existing,
+          remote.completed ? "google_completed" : "google_deleted",
+          remote.updatedAt ?? new Date(),
+        );
+        return "deleted";
+      }
+      return "ignored";
+    }
+
+    const remoteFingerprint = projectedTaskFingerprint({
+      title: remote.title,
+      notes: remote.notes,
+      dueDate: remote.dueDate,
+      taskListId: subscription.googleTaskListId,
+    });
+    const canonicalLocalFingerprint = existing?.googleTaskListId
+      ? projectedTaskFingerprint({
+          title: existing.title,
+          notes: existing.bodyPlaintext,
+          dueDate: existing.dueDate,
+          taskListId: existing.googleTaskListId,
+        })
+      : null;
+
+    if (existing && isProjectedTaskEcho(
+      remoteFingerprint,
+      existing.lastProjectedFingerprint,
+      canonicalLocalFingerprint,
+    )) {
+      await prisma.note.update({
+        where: { id: existing.id },
+        data: {
+          remoteEtag: remote.etag,
+          lastProjectedFingerprint: remoteFingerprint,
+        },
+      });
+      return "echo";
+    }
+
+    // A different fingerprint is a genuine Google edit. Google wins, including
+    // over an older queued projection, so the stale projection must not run.
+    const mergedMarkdown = plainTaskToMarkdown(remote.title, remote.notes);
+    const now = remote.updatedAt ?? new Date();
+    const noteId = existing?.id ?? randomUUID();
+    const reconciliation = await prisma.$transaction(async (tx) => {
+      if (existing?.pendingProjection) {
+        await tx.projectionJob.deleteMany({
+          where: { userId, noteId: existing.id },
+        });
+      }
+      const reconciled = await tx.note.upsert({
+        where: { id: noteId },
+        create: {
+          id: noteId,
+          userId,
+          title: remote.title,
+          bodyMarkdown: mergedMarkdown,
+          bodyPlaintext: remote.notes,
+          googleTaskListId: subscription.googleTaskListId,
+          taskListNameCache: subscription.title,
+          googleTaskId: remote.id,
+          remoteEtag: remote.etag,
+          lastProjectedFingerprint: remoteFingerprint,
+          dueDate: remote.dueDate ?? undefined,
+          serverUpdatedAt: now,
+          pendingProjection: false,
+        },
+        update: {
+          title: remote.title,
+          bodyMarkdown: mergedMarkdown,
+          bodyPlaintext: remote.notes,
+          googleTaskListId: subscription.googleTaskListId,
+          taskListNameCache: subscription.title,
+          googleTaskId: remote.id,
+          remoteEtag: remote.etag,
+          lastProjectedFingerprint: remoteFingerprint,
+          dueDate: remote.dueDate,
+          deletedAt: null,
+          deletionReason: null,
+          pendingProjection: false,
+          lastProjectionError: null,
+          serverVersion: { increment: 1 },
+          serverUpdatedAt: now,
+        },
+      });
+      const event = await tx.eventLog.create({
+        data: {
+          userId,
+          type: "note.upsert",
+          noteId: reconciled.id,
+          payload: { note: noteToDto(reconciled) } as unknown as Prisma.JsonObject,
+        },
+      });
+      return { note: reconciled, event };
+    });
+    sseHub.publish(userId, {
+      sequence: reconciliation.event.sequence,
+      type: reconciliation.event.type,
+      payload: reconciliation.event.payload,
+    });
+    return "changed";
   }
 
   private async pullRemoteChanges(userId: string) {
@@ -957,71 +1256,7 @@ export class SyncService {
           maxUpdatedAt = remote.updatedAt;
         }
 
-        const existing = await this.findOwnedNoteByGoogleTaskId(
-          userId,
-          remote.id,
-          subscription.googleTaskListId,
-        );
-
-        if (remote.deleted || remote.completed) {
-          if (existing && !existing.deletedAt) {
-            await this.markNoteDeletedFromGoogle(
-              existing,
-              remote.completed ? "google_completed" : "google_deleted",
-              remote.updatedAt ?? new Date(),
-            );
-          }
-          continue;
-        }
-
-        // Local pendingProjection means the desktop already changed this note and the
-        // remote snapshot is stale until projection catches up. Do not let pull sync
-        // immediately overwrite list/body/title back to the old remote state.
-        if (existing?.pendingProjection) {
-          continue;
-        }
-
-        const mergedMarkdown = plainTaskToMarkdown(remote.title, remote.notes);
-        const now = remote.updatedAt ?? new Date();
-        const noteId = existing?.id ?? randomUUID();
-        const note = await prisma.note.upsert({
-          where: {
-            id: noteId,
-          },
-          create: {
-            id: noteId,
-            userId,
-            title: remote.title,
-            bodyMarkdown: mergedMarkdown,
-            bodyPlaintext: remote.notes,
-            googleTaskListId: subscription.googleTaskListId,
-            taskListNameCache: subscription.title,
-            googleTaskId: remote.id,
-            remoteEtag: remote.etag,
-            dueDate: remote.dueDate ?? undefined,
-            serverUpdatedAt: now,
-            pendingProjection: false,
-          },
-          update: {
-            title: remote.title,
-            bodyMarkdown: mergedMarkdown,
-            bodyPlaintext: remote.notes,
-            googleTaskListId: subscription.googleTaskListId,
-            taskListNameCache: subscription.title,
-            googleTaskId: remote.id,
-            remoteEtag: remote.etag,
-            dueDate: remote.dueDate ?? undefined,
-            deletedAt: null,
-            deletionReason: null,
-            pendingProjection: false,
-            lastProjectionError: null,
-            serverVersion: { increment: 1 },
-            serverUpdatedAt: now,
-          },
-        });
-        await appendEvent(userId, "note.upsert", note.id, {
-          note: noteToDto(note),
-        });
+        await this.reconcileRemoteTask(userId, subscription, remote);
       }
 
       await prisma.syncCheckpoint.upsert({

@@ -174,70 +174,41 @@ final class SyncManager: ObservableObject {
             _ = noteManager.updateNoteTaskList(note.id, taskListId: taskList, taskListNameCache: taskListName)
         }
         guard let refreshed = noteManager.getNote(note.id) else { return }
-        queueCreateMutation(for: refreshed)
+        queueUpsertMutation(for: refreshed)
     }
 
     func noteContentChanged(_ note: Note) {
         guard isAuthenticated else { return }
-        if note.serverVersion == 0 {
-            queueCreateMutation(for: note)
-            return
-        }
-        queueMutation(
-            type: .updateNoteBody,
-            note: note,
-            coalesceKey: "note:\(note.id.uuidString):body",
-            payload: CreateNoteMutationPayload(
-                content: note.content,
-                taskListId: note.taskListId,
-                taskListNameCache: note.taskListNameCache,
-                dueDate: note.dueDate
-            )
-        )
+        queueUpsertMutation(for: note)
     }
 
     func noteDeleted(_ note: Note) {
         guard isAuthenticated else { return }
+        if note.serverVersion == 0 {
+            if !persistenceManager.deleteQueuedMutations(noteId: note.id.uuidString.lowercased()) {
+                syncErrorMessage = persistenceManager.errorMessage
+            }
+            return
+        }
         queueMutation(
             type: .deleteNote,
             note: note,
-            coalesceKey: "note:\(note.id.uuidString):delete",
+            coalesceKey: "note:\(note.id.uuidString.lowercased())",
             payload: DeleteNoteMutationPayload()
         )
     }
 
     func noteTaskListChanged(_ note: Note) {
         guard isAuthenticated else { return }
-        if note.serverVersion == 0 {
-            queueCreateMutation(for: note)
-            return
-        }
-        queueMutation(
-            type: .moveNoteList,
-            note: note,
-            coalesceKey: "note:\(note.id.uuidString):list",
-            payload: MoveNoteListMutationPayload(
-                taskListId: note.taskListId,
-                taskListNameCache: note.taskListNameCache
-            )
-        )
+        queueUpsertMutation(for: note)
     }
 
     func noteDueDateChanged(_ note: Note) {
         guard isAuthenticated else { return }
-        if note.serverVersion == 0 {
-            queueCreateMutation(for: note)
-            return
-        }
-        queueMutation(
-            type: .setNoteDueDate,
-            note: note,
-            coalesceKey: "note:\(note.id.uuidString):due",
-            payload: DueDateMutationPayload(dueDate: note.dueDate)
-        )
+        queueUpsertMutation(for: note)
     }
 
-    private func queueCreateMutation(for note: Note) {
+    private func queueUpsertMutation(for note: Note) {
         guard let taskListId = note.taskListId ?? defaultTaskList()?.id else { return }
         let taskListName = note.taskListNameCache ?? defaultTaskList()?.title
         let refreshed = noteManager.updateNoteTaskList(
@@ -247,12 +218,12 @@ final class SyncManager: ObservableObject {
         ) ?? note
 
         queueMutation(
-            type: .createNote,
+            type: .upsertNote,
             note: refreshed,
-            coalesceKey: "note:\(refreshed.id.uuidString):create",
-            payload: CreateNoteMutationPayload(
+            coalesceKey: "note:\(refreshed.id.uuidString.lowercased())",
+            payload: UpsertNoteMutationPayload(
                 content: refreshed.content,
-                taskListId: refreshed.taskListId,
+                taskListId: taskListId,
                 taskListNameCache: refreshed.taskListNameCache,
                 dueDate: refreshed.dueDate
             )
@@ -277,11 +248,16 @@ final class SyncManager: ObservableObject {
             coalesceKey: coalesceKey,
             noteId: note.id.uuidString.lowercased(),
             type: type,
+            baseServerVersion: note.serverVersion,
             payloadJSON: payloadJSON,
             createdAt: Date(),
             updatedAt: Date()
         )
-        persistenceManager.saveQueuedMutation(mutation)
+        guard persistenceManager.saveQueuedMutation(mutation) else {
+            syncErrorMessage = persistenceManager.errorMessage ?? "The pending change could not be saved locally."
+            noteManager.updateNoteSyncState(note.id, syncState: .error, errorMessage: syncErrorMessage)
+            return
+        }
         noteManager.updateNoteSyncState(note.id, syncState: .pending)
         scheduleOutboxFlush()
     }
@@ -304,12 +280,13 @@ final class SyncManager: ObservableObject {
             persistSyncState()
 
             let payload = MutationsRequest(
-                mutations: mutations.compactMap { mutation in
-                    guard let json = try? mutationPayloadObject(from: mutation.payloadJSON) else { return nil }
+                mutations: try mutations.map { mutation in
+                    let json = try mutationPayloadObject(from: mutation.payloadJSON)
                     return OutgoingMutation(
                         id: mutation.id,
                         type: mutation.type.rawValue,
                         noteId: mutation.noteId,
+                        baseServerVersion: mutation.baseServerVersion,
                         payload: json
                     )
                 }
@@ -321,10 +298,73 @@ final class SyncManager: ObservableObject {
                 body: payload,
                 authorized: true
             )
-            persistenceManager.deleteQueuedMutations(ids: mutations.map(\.id))
+            let requestedByID = Dictionary(uniqueKeysWithValues: mutations.map { ($0.id, $0) })
+            var acknowledgedIDs: [String] = []
+
+            for result in response.results {
+                guard let requested = requestedByID[result.id] else { continue }
+                if result.status == .conflict, result.note == nil, result.tombstone == nil {
+                    throw NSError(
+                        domain: "SyncManager",
+                        code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "The server reported a conflict without canonical note data; the local change remains queued."]
+                    )
+                }
+                if requested.type == .upsertNote, result.note == nil, result.tombstone == nil {
+                    throw NSError(
+                        domain: "SyncManager",
+                        code: 5,
+                        userInfo: [NSLocalizedDescriptionKey: "The server did not acknowledge the note snapshot; the local change remains queued."]
+                    )
+                }
+
+                if let note = result.note {
+                    let hasNewerLocalChange = persistenceManager.hasQueuedMutation(
+                        noteId: requested.noteId,
+                        excludingIDs: [result.id]
+                    )
+                    if hasNewerLocalChange {
+                        guard persistenceManager.rebaseQueuedMutations(
+                            noteId: requested.noteId,
+                            baseServerVersion: note.serverVersion
+                        ) else {
+                            throw NSError(
+                                domain: "SyncManager",
+                                code: 2,
+                                userInfo: [NSLocalizedDescriptionKey: "A newer pending edit could not be rebased locally."]
+                            )
+                        }
+                        noteManager.acknowledgeServerVersion(
+                            noteIdString: requested.noteId,
+                            serverVersion: note.serverVersion,
+                            serverUpdatedAt: note.serverUpdatedAt,
+                            stillPending: true
+                        )
+                    } else if let applied = noteManager.applyServerNote(note) {
+                        onRemoteNoteApplied?(applied)
+                    }
+                }
+
+                if let tombstone = result.tombstone {
+                    noteManager.applyServerDeletion(tombstone)
+                    if let uuid = UUID(uuidString: tombstone.noteId) {
+                        onRemoteNoteDeleted?(uuid)
+                    }
+                }
+                acknowledgedIDs.append(result.id)
+            }
+
+            guard persistenceManager.deleteQueuedMutations(ids: acknowledgedIDs) else {
+                throw NSError(
+                    domain: "SyncManager",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "The server accepted changes, but their local outbox acknowledgements could not be saved."]
+                )
+            }
             syncSessionState.lastEventSequence = max(syncSessionState.lastEventSequence, response.latestSequence)
             syncSessionState.lastSyncCompletedAt = Date()
             syncSessionState.lastSyncResult = "Queued changes uploaded."
+            syncErrorMessage = nil
             persistSyncState()
         } catch {
             syncErrorMessage = error.localizedDescription
@@ -409,18 +449,29 @@ final class SyncManager: ObservableObject {
 
     private func applyBootstrap(_ bootstrap: BootstrapResponse) {
         taskLists = bootstrap.taskLists
-        persistenceManager.saveTaskLists(bootstrap.taskLists)
+        if !persistenceManager.saveTaskLists(bootstrap.taskLists) {
+            syncErrorMessage = persistenceManager.errorMessage
+        }
         syncSessionState.lastEventSequence = bootstrap.latestSequence
         persistSyncState()
 
-        for noteIdString in bootstrap.deletedNoteIds ?? [] {
-            noteManager.applyServerDeletion(
-                noteIdString: noteIdString,
-                reason: "bootstrap_reconciliation"
-            )
+        if let tombstones = bootstrap.tombstones {
+            for tombstone in tombstones
+            where !persistenceManager.hasQueuedMutation(noteId: tombstone.noteId) {
+                noteManager.applyServerDeletion(tombstone)
+            }
+        } else {
+            for noteIdString in bootstrap.deletedNoteIds ?? []
+            where !persistenceManager.hasQueuedMutation(noteId: noteIdString) {
+                noteManager.applyServerDeletion(
+                    noteIdString: noteIdString,
+                    reason: "bootstrap_reconciliation"
+                )
+            }
         }
 
-        for note in bootstrap.notes {
+        for note in bootstrap.notes
+        where !persistenceManager.hasQueuedMutation(noteId: note.id) {
             if let applied = noteManager.applyServerNote(note) {
                 onRemoteNoteApplied?(applied)
             }
@@ -466,7 +517,7 @@ final class SyncManager: ObservableObject {
         guard let defaultTaskList = defaultTaskList() else { return }
         let notesToImport = noteManager.assignDefaultTaskListToUnsyncedNotes(defaultTaskList)
         for note in notesToImport {
-            queueCreateMutation(for: note)
+            queueUpsertMutation(for: note)
         }
     }
 
@@ -524,17 +575,20 @@ final class SyncManager: ObservableObject {
     private func handleEventData(_ dataString: String, eventName: String?) async {
         guard let data = dataString.data(using: .utf8) else { return }
         guard let envelope = try? decoder.decode(ServerEventEnvelope.self, from: data) else { return }
+        guard envelope.sequence > syncSessionState.lastEventSequence else { return }
 
         syncSessionState.lastEventSequence = max(syncSessionState.lastEventSequence, envelope.sequence)
         persistSyncState()
 
         switch (eventName ?? envelope.type, envelope.payload) {
         case ("note.upsert", .noteUpsert(let payload)):
+            guard !persistenceManager.hasQueuedMutation(noteId: payload.note.id) else { return }
             if let note = noteManager.applyServerNote(payload.note) {
                 onRemoteNoteApplied?(note)
             }
         case ("note.delete", .noteDelete(let payload)):
-            noteManager.applyServerDeletion(noteIdString: payload.noteId, reason: payload.deletionReason)
+            guard !persistenceManager.hasQueuedMutation(noteId: payload.noteId) else { return }
+            noteManager.applyServerDeletion(payload)
             if let uuid = UUID(uuidString: payload.noteId) {
                 onRemoteNoteDeleted?(uuid)
             }
@@ -608,19 +662,10 @@ final class SyncManager: ObservableObject {
     }
 }
 
-private struct CreateNoteMutationPayload: Codable {
+private struct UpsertNoteMutationPayload: Codable {
     let content: String
     let taskListId: String?
     let taskListNameCache: String?
-    let dueDate: String?
-}
-
-private struct MoveNoteListMutationPayload: Codable {
-    let taskListId: String?
-    let taskListNameCache: String?
-}
-
-private struct DueDateMutationPayload: Codable {
     let dueDate: String?
 }
 
@@ -645,5 +690,6 @@ private struct OutgoingMutation: Codable {
     let id: String
     let type: String
     let noteId: String
+    let baseServerVersion: Int
     let payload: [String: String?]
 }

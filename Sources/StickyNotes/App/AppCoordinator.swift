@@ -13,7 +13,7 @@ final class AppCoordinator: ObservableObject {
 
     var isQuitting = false
 
-    private let persistenceManager: PersistenceManager
+    let persistenceManager: PersistenceManager
     private var cancellables = Set<AnyCancellable>()
 
     init() {

@@ -10,6 +10,8 @@ const baseConfigSchema = z.object({
   APP_ENCRYPTION_KEY: z.string().min(1),
   SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
   GOOGLE_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
+  SCHEDULED_SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
+  APP_RELEASE_SHA: z.string().min(1).default("development"),
   MOCK_USER_EMAIL: z.string().email().default("local-dev@mdstickynotes.dev"),
   ALLOWED_GOOGLE_EMAILS: z.string().default(""),
   INTERNAL_CRON_AUDIENCE: z.string().default(""),

@@ -26,6 +26,7 @@ import { yaml } from '@codemirror/lang-yaml';
 import { vue } from '@codemirror/lang-vue';
 import { StreamLanguage } from '@codemirror/language';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { verticalNavigationTarget } from './vertical-navigation.js';
 
 // Static language list for WKWebView (no dynamic imports)
 const staticLanguages = {
@@ -727,9 +728,8 @@ const mathRenderField = StateField.define({
   },
 });
 
-// ─── Block math navigation ─────────────────────────────────────────────────
-// When a block math widget is rendered (cursor outside), arrow keys should
-// jump over it instead of getting stuck.
+// ─── Rendered block navigation ─────────────────────────────────────────────
+// Keep vertical movement logical even when visual widgets alter line geometry.
 
 function getRenderedBlockMathRanges(state) {
   const ranges = [];
@@ -750,52 +750,49 @@ function getRenderedBlockMathRanges(state) {
 // Helper: find if a document position is inside any rendered block math range
 function findBlockMathAt(state, pos) {
   const ranges = getRenderedBlockMathRanges(state);
-  return ranges.find(r => pos >= r.from && pos <= r.to) || null;
+  const range = ranges.find(r => pos >= r.from && pos <= r.to);
+  return range ? { ...range, kind: 'math' } : null;
 }
 
-const blockMathNavKeymap = [
+function findTableAt(state, pos) {
+  let result = null;
+  syntaxTree(state).iterate({
+    enter(node) {
+      if (node.name === 'Table' && pos >= node.from && pos <= node.to) {
+        result = { from: node.from, to: node.to, kind: 'table' };
+      }
+    },
+  });
+  return result;
+}
+
+function runVerticalBlockNavigation(view, direction) {
+  const { head } = view.state.selection.main;
+  const currentLine = view.state.doc.lineAt(head);
+  const adjacentLineNumber = currentLine.number + direction;
+  const adjacentPosition = adjacentLineNumber < 1
+    ? 0
+    : adjacentLineNumber > view.state.doc.lines
+      ? view.state.doc.length
+      : view.state.doc.line(adjacentLineNumber).from;
+  const block = findBlockMathAt(view.state, adjacentPosition)
+    ?? findTableAt(view.state, adjacentPosition);
+  const result = verticalNavigationTarget(view.state.doc, head, direction, block);
+  if (!result.handled) return false;
+  if (result.target !== head) {
+    view.dispatch({ selection: { anchor: result.target }, scrollIntoView: true });
+  }
+  return true;
+}
+
+const renderedBlockNavKeymap = [
   {
     key: 'ArrowDown',
-    run: (view) => {
-      const { head } = view.state.selection.main;
-      const line = view.state.doc.lineAt(head);
-      if (line.number >= view.state.doc.lines) return false;
-      const nextLine = view.state.doc.line(line.number + 1);
-      const r = findBlockMathAt(view.state, nextLine.from);
-      if (!r) return false;
-      // Jump past the block math
-      const afterPos = Math.min(r.to + 1, view.state.doc.length);
-      const target = afterPos >= view.state.doc.length
-        ? view.state.doc.length
-        : view.state.doc.lineAt(afterPos).from;
-      view.dispatch({
-        selection: { anchor: target },
-        scrollIntoView: true,
-      });
-      return true;
-    },
+    run: (view) => runVerticalBlockNavigation(view, 1),
   },
   {
     key: 'ArrowUp',
-    run: (view) => {
-      const { head } = view.state.selection.main;
-      const line = view.state.doc.lineAt(head);
-      if (line.number <= 1) return false;
-      const prevLine = view.state.doc.line(line.number - 1);
-      const r = findBlockMathAt(view.state, prevLine.from);
-      if (!r) return false;
-      // Jump before the block math
-      const target = r.from === 0
-        ? 0
-        : view.state.doc.lineAt(r.from).from > 0
-          ? view.state.doc.lineAt(r.from - 1).to
-          : 0;
-      view.dispatch({
-        selection: { anchor: target },
-        scrollIntoView: true,
-      });
-      return true;
-    },
+    run: (view) => runVerticalBlockNavigation(view, -1),
   },
 ];
 
@@ -1363,7 +1360,7 @@ function initEditor(initialContent = '') {
     doc: initialContent,
     extensions: [
       history(),
-      keymap.of([...blockMathNavKeymap, ...formattingKeymap, ...searchKeymap, ...defaultKeymap, ...historyKeymap]),
+      keymap.of([...renderedBlockNavKeymap, ...formattingKeymap, ...searchKeymap, ...defaultKeymap, ...historyKeymap]),
       markdown({ extensions: GFM, codeLanguages: findLanguage }),
       syntaxHighlighting(markdownHighlightStyle),
       syntaxHighlighting(defaultHighlightStyle),  // Code block syntax colors

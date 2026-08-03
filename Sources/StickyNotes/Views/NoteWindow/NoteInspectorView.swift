@@ -30,21 +30,24 @@ struct NoteInspectorView: View {
                 Text("Task Sync")
                     .font(.headline)
 
-                Picker("List", selection: Binding(
-                    get: { note.taskListId ?? "" },
-                    set: { newValue in
-                        coordinator.setNoteTaskList(
-                            noteId: noteId,
-                            taskListId: newValue.isEmpty ? nil : newValue
-                        )
+                if note.taskListId == nil && !syncManager.isAuthenticated {
+                    Text("Local only until you sign in and choose a default task list.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("List", selection: Binding(
+                        get: { note.taskListId ?? selectedTaskLists.first?.id ?? "" },
+                        set: { newValue in
+                            guard !newValue.isEmpty else { return }
+                            coordinator.setNoteTaskList(noteId: noteId, taskListId: newValue)
+                        }
+                    )) {
+                        ForEach(selectedTaskLists) { taskList in
+                            Text(taskList.title).tag(taskList.id)
+                        }
                     }
-                )) {
-                    Text("Unassigned").tag("")
-                    ForEach(selectedTaskLists) { taskList in
-                        Text(taskList.title).tag(taskList.id)
-                    }
+                    .disabled(selectedTaskLists.isEmpty)
                 }
-                .disabled(selectedTaskLists.isEmpty)
 
                 if syncManager.isAuthenticated && syncManager.taskLists.isEmpty {
                     Text("No task lists loaded yet. Refresh them in Settings.")

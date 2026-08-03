@@ -8,11 +8,7 @@ enum NoteSyncState: String, Codable, CaseIterable {
 }
 
 enum SyncMutationType: String, Codable {
-    case createNote = "create_note"
-    case updateNoteBody = "update_note_body"
-    case updateNoteTitle = "update_note_title"
-    case moveNoteList = "move_note_list"
-    case setNoteDueDate = "set_note_due_date"
+    case upsertNote = "upsert_note"
     case deleteNote = "delete_note"
 }
 
@@ -133,6 +129,7 @@ struct QueuedMutation: Identifiable, Codable, Equatable {
     let coalesceKey: String
     let noteId: String
     let type: SyncMutationType
+    var baseServerVersion: Int
     let payloadJSON: String
     let createdAt: Date
     var updatedAt: Date
@@ -159,6 +156,7 @@ struct BootstrapResponse: Codable {
     let notes: [ServerNoteDTO]
     let taskLists: [TaskListInfo]
     let deletedNoteIds: [String]?
+    let tombstones: [ServerDeletePayload]?
     let latestSequence: Int
 }
 
@@ -174,6 +172,20 @@ struct TaskListsResponse: Codable {
 
 struct MutationsResponse: Codable {
     let latestSequence: Int
+    let results: [MutationResultDTO]
+}
+
+enum MutationResultStatus: String, Codable {
+    case applied
+    case duplicate
+    case conflict
+}
+
+struct MutationResultDTO: Codable {
+    let id: String
+    let status: MutationResultStatus
+    let note: ServerNoteDTO?
+    let tombstone: ServerDeletePayload?
 }
 
 struct SyncNowResponse: Codable {
@@ -233,6 +245,8 @@ struct ServerNotePayload: Codable, Equatable {
 struct ServerDeletePayload: Codable, Equatable {
     let noteId: String
     let deletionReason: String
+    let serverVersion: Int
+    let serverUpdatedAt: Date
 }
 
 struct PreferencesPayload: Codable, Equatable {

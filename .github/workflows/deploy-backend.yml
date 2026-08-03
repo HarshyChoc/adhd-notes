@@ -1,44 +1,82 @@
-name: Deploy Backend
+name: Runtime CI
 
 on:
+  pull_request:
   push:
     branches:
       - main
-    paths:
-      - "backend/**"
-      - "scripts/deploy-backend-gcp.sh"
-      - "scripts/deploy-scheduler-gcp.sh"
-      - ".github/workflows/deploy-backend.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+  backend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      SYNC_PROVIDER: mock
+      APP_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    defaults:
+      run:
+        working-directory: backend
     steps:
       - uses: actions/checkout@v4
-
-      - uses: google-github-actions/auth@v2
+      - uses: actions/setup-node@v4
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run prisma:validate
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=moderate
 
-      - uses: google-github-actions/setup-gcloud@v2
+  editor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editor-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor-web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=moderate
 
-      - name: Deploy Cloud Run service
-        run: ./scripts/deploy-backend-gcp.sh
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL }}
-          INTERNAL_CRON_SERVICE_ACCOUNT_EMAIL: ${{ vars.INTERNAL_CRON_SERVICE_ACCOUNT_EMAIL }}
+  macos-app:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+      - run: SKIP_DMG=1 SKIP_ZIP=1 ./build-app.sh
 
-      - name: Deploy Cloud Scheduler job
-        run: ./scripts/deploy-scheduler-gcp.sh
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL }}
-          INTERNAL_CRON_SERVICE_ACCOUNT_EMAIL: ${{ vars.INTERNAL_CRON_SERVICE_ACCOUNT_EMAIL }}
+  repository-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+      - run: git diff --check HEAD~1 HEAD

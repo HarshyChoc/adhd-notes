@@ -4,11 +4,15 @@ struct SettingsView: View {
     let coordinator: AppCoordinator
     @ObservedObject private var syncManager: SyncManager
     @ObservedObject private var launchAtLoginManager: LaunchAtLoginManager
+    @ObservedObject private var hotKeyManager: GlobalHotKeyManager
+    @ObservedObject private var persistenceManager: PersistenceManager
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         _syncManager = ObservedObject(wrappedValue: coordinator.syncManager)
         _launchAtLoginManager = ObservedObject(wrappedValue: coordinator.launchAtLoginManager)
+        _hotKeyManager = ObservedObject(wrappedValue: GlobalHotKeyManager.shared)
+        _persistenceManager = ObservedObject(wrappedValue: coordinator.persistenceManager)
     }
 
     var body: some View {
@@ -37,6 +41,40 @@ struct SettingsView: View {
                     Text(error)
                         .font(.footnote)
                         .foregroundStyle(.red)
+                }
+            }
+
+            Section("Global Shortcuts") {
+                HStack {
+                    Text("New Note")
+                    Spacer()
+                    Text("Control + Option").foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Show / Hide Notes")
+                    Spacer()
+                    Text("Option + Command").foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Circle()
+                        .fill(hotKeyManager.hasInputMonitoringAccess ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    Text(hotKeyManager.hasInputMonitoringAccess ? "Input Monitoring enabled" : "Input Monitoring required")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if !hotKeyManager.hasInputMonitoringAccess {
+                        Button("Open System Settings") {
+                            hotKeyManager.openInputMonitoringSettings()
+                        }
+                    }
+                }
+
+                if let error = hotKeyManager.errorMessage {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -72,6 +110,17 @@ struct SettingsView: View {
                     Button("Reset To Production API") {
                         syncManager.resetBackendBaseURLOverride()
                     }
+                }
+            }
+
+            if let persistenceError = persistenceManager.errorMessage {
+                Section("Local Data") {
+                    Text(persistenceError)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                    Text("Changes remain visible in this session, but MD Sticky Notes could not confirm that they were written to disk.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -139,6 +188,7 @@ struct SettingsView: View {
         .frame(width: 520, height: 470)
         .onAppear {
             launchAtLoginManager.refresh()
+            hotKeyManager.refreshPermissionStatus()
         }
     }
 }
