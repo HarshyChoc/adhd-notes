@@ -3,7 +3,17 @@ import WebKit
 
 /// Bridge between Swift and the shared JavaScript editor.
 /// Routes messages by noteId to the appropriate handler.
-class SharedEditorBridge: NSObject, WKScriptMessageHandler {
+final class SharedEditorBridge: NSObject, WKScriptMessageHandler {
+
+    private enum EditorAction: Sendable {
+        case ready
+        case contentChanged(content: String, noteId: UUID?)
+        case requestSave
+        case openURL(URL)
+        case log(String)
+        case error(String)
+        case unknown(String)
+    }
 
     // MARK: - WKScriptMessageHandler
 
@@ -11,31 +21,68 @@ class SharedEditorBridge: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard let body = message.body as? [String: Any],
-              let action = body["action"] as? String else {
+        guard let action = Self.parseAction(message.body) else {
             print("[SharedEditorBridge] Invalid message format")
             return
         }
 
-        handleAction(action, body: body)
+        Task { @MainActor in
+            Self.handleAction(action)
+        }
     }
 
     // MARK: - Action Handling
 
-    private func handleAction(_ action: String, body: [String: Any]) {
-        let manager = SharedWebViewManager.shared
+    private static func parseAction(_ messageBody: Any) -> EditorAction? {
+        guard let body = messageBody as? [String: Any],
+              let action = body["action"] as? String else {
+            return nil
+        }
 
         switch action {
         case "ready":
+            return .ready
+
+        case "contentChanged":
+            guard let content = body["content"] as? String else { return nil }
+            let noteId = (body["noteId"] as? String).flatMap(UUID.init(uuidString:))
+            return .contentChanged(content: content, noteId: noteId)
+
+        case "requestSave":
+            return .requestSave
+
+        case "openURL":
+            guard let urlString = body["url"] as? String,
+                  let url = URL(string: urlString) else { return nil }
+            return .openURL(url)
+
+        case "log":
+            guard let message = body["message"] as? String else { return nil }
+            return .log(message)
+
+        case "error":
+            guard let message = body["message"] as? String else { return nil }
+            return .error(message)
+
+        default:
+            return .unknown(action)
+        }
+    }
+
+    @MainActor
+    private static func handleAction(_ action: EditorAction) {
+        let manager = SharedWebViewManager.shared
+
+        switch action {
+        case .ready:
             // markReady() handles loading any queued note internally
             manager.markReady()
 
-        case "contentChanged":
+        case let .contentChanged(content, messageNoteId):
             // Route to the correct note via noteId
-            guard let content = body["content"] as? String else { return }
             let noteId: UUID
-            if let idString = body["noteId"] as? String, let id = UUID(uuidString: idString) {
-                noteId = id
+            if let messageNoteId {
+                noteId = messageNoteId
             } else if let activeId = manager.activeNoteId {
                 noteId = activeId
             } else {
@@ -43,29 +90,22 @@ class SharedEditorBridge: NSObject, WKScriptMessageHandler {
             }
             manager.coordinator?.handleContentChange(noteId: noteId, content: content)
 
-        case "requestSave":
+        case .requestSave:
             if let noteId = manager.activeNoteId,
                let note = manager.coordinator?.noteManager.getNote(noteId) {
                 manager.coordinator?.noteManager.saveNoteImmediately(note)
             }
 
-        case "openURL":
-            if let urlString = body["url"] as? String,
-               let url = URL(string: urlString) {
-                NSWorkspace.shared.open(url)
-            }
+        case let .openURL(url):
+            NSWorkspace.shared.open(url)
 
-        case "log":
-            if let msg = body["message"] as? String {
-                print("[SharedEditorBridge][JS] \(msg)")
-            }
+        case let .log(message):
+            print("[SharedEditorBridge][JS] \(message)")
 
-        case "error":
-            if let msg = body["message"] as? String {
-                print("[SharedEditorBridge][JS Error] \(msg)")
-            }
+        case let .error(message):
+            print("[SharedEditorBridge][JS Error] \(message)")
 
-        default:
+        case let .unknown(action):
             print("[SharedEditorBridge] Unknown action: \(action)")
         }
     }
