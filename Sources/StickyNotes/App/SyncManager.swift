@@ -21,6 +21,10 @@ final class SyncManager: ObservableObject {
     private let decoder = JSONDecoder()
 
     private var eventStreamTask: Task<Void, Never>?
+    private var eventStreamSession: URLSession?
+    private var eventStreamDataTask: URLSessionDataTask?
+    private var eventStreamDelegate: SSEStreamDelegate?
+    private var eventStreamGeneration = UUID()
     private var pendingFlushTask: Task<Void, Never>?
     private var sessionToken: String?
 
@@ -103,7 +107,7 @@ final class SyncManager: ObservableObject {
     }
 
     func signOut() {
-        eventStreamTask?.cancel()
+        stopEventStream()
         pendingFlushTask?.cancel()
         let preservedCustomBackendBaseURL = syncSessionState.customBackendBaseURL
         let preservedUseCustomBackendBaseURL = syncSessionState.useCustomBackendBaseURL
@@ -526,7 +530,8 @@ final class SyncManager: ObservableObject {
     }
 
     private func startEventStream() {
-        eventStreamTask?.cancel()
+        stopEventStream()
+        guard isAuthenticated else { return }
         guard var request = makeRequest(
             path: "/v1/events/stream?since=\(syncSessionState.lastEventSequence)",
             method: "GET",
@@ -537,51 +542,74 @@ final class SyncManager: ObservableObject {
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
 
-        eventStreamTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                guard
-                    let httpResponse = response as? HTTPURLResponse,
-                    (200..<300).contains(httpResponse.statusCode)
-                else {
-                    if let httpResponse = response as? HTTPURLResponse,
-                       httpResponse.statusCode == 401 {
-                        self.invalidateExpiredSession()
-                        return
-                    }
-                    throw URLError(.badServerResponse)
+        let generation = UUID()
+        eventStreamGeneration = generation
+        let delegate = SSEStreamDelegate(
+            onEvent: { [weak self] eventName, dataString in
+                Task { @MainActor [weak self] in
+                    guard let self, self.eventStreamGeneration == generation else { return }
+                    self.handleEventData(dataString, eventName: eventName)
                 }
-
-                var bufferedEventName: String?
-                var bufferedData = ""
-
-                for try await line in bytes.lines {
-                    if Task.isCancelled { return }
-                    if line.hasPrefix("event: ") {
-                        bufferedEventName = String(line.dropFirst(7))
-                    } else if line.hasPrefix("data: ") {
-                        bufferedData += String(line.dropFirst(6))
-                    } else if line.isEmpty {
-                        if !bufferedData.isEmpty {
-                            await self.handleEventData(bufferedData, eventName: bufferedEventName)
-                        }
-                        bufferedEventName = nil
-                        bufferedData = ""
-                    }
+            },
+            onComplete: { [weak self] statusCode, error in
+                Task { @MainActor [weak self] in
+                    self?.handleEventStreamCompletion(
+                        generation: generation,
+                        statusCode: statusCode,
+                        error: error
+                    )
                 }
-                guard !Task.isCancelled else { return }
-                throw URLError(.networkConnectionLost)
-            } catch {
-                guard !Task.isCancelled else { return }
-                self.syncErrorMessage = "Live stream disconnected: \(error.localizedDescription)"
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                self.startEventStream()
             }
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.waitsForConnectivity = true
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        let dataTask = session.dataTask(with: request)
+        eventStreamDelegate = delegate
+        eventStreamSession = session
+        eventStreamDataTask = dataTask
+        dataTask.resume()
+    }
+
+    private func stopEventStream() {
+        eventStreamGeneration = UUID()
+        eventStreamTask?.cancel()
+        eventStreamTask = nil
+        eventStreamDataTask?.cancel()
+        eventStreamDataTask = nil
+        eventStreamSession?.invalidateAndCancel()
+        eventStreamSession = nil
+        eventStreamDelegate = nil
+    }
+
+    private func handleEventStreamCompletion(
+        generation: UUID,
+        statusCode: Int?,
+        error: Error?
+    ) {
+        guard eventStreamGeneration == generation else { return }
+        eventStreamDataTask = nil
+        eventStreamSession?.finishTasksAndInvalidate()
+        eventStreamSession = nil
+        eventStreamDelegate = nil
+
+        if statusCode == 401 {
+            invalidateExpiredSession()
+            return
+        }
+        guard isAuthenticated else { return }
+
+        let reason = error?.localizedDescription ?? "The server closed the connection."
+        syncErrorMessage = "Live stream disconnected: \(reason)"
+        eventStreamTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, let self, self.eventStreamGeneration == generation else { return }
+            self.startEventStream()
         }
     }
 
-    private func handleEventData(_ dataString: String, eventName: String?) async {
+    private func handleEventData(_ dataString: String, eventName: String?) {
         guard let data = dataString.data(using: .utf8) else { return }
         guard let envelope = try? decoder.decode(ServerEventEnvelope.self, from: data) else { return }
         guard envelope.sequence > syncSessionState.lastEventSequence else { return }
@@ -659,7 +687,7 @@ final class SyncManager: ObservableObject {
     }
 
     private func invalidateExpiredSession() {
-        eventStreamTask?.cancel()
+        stopEventStream()
         pendingFlushTask?.cancel()
         sessionKeychain.deleteValue()
         sessionToken = nil
@@ -683,6 +711,67 @@ final class SyncManager: ObservableObject {
 
     private func persistSyncState() {
         persistenceManager.saveSyncSessionState(syncSessionState)
+    }
+}
+
+private final class SSEStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let onEvent: @Sendable (String?, String) -> Void
+    private let onComplete: @Sendable (Int?, Error?) -> Void
+    private var statusCode: Int?
+    private var buffer = Data()
+
+    init(
+        onEvent: @escaping @Sendable (String?, String) -> Void,
+        onComplete: @escaping @Sendable (Int?, Error?) -> Void
+    ) {
+        self.onEvent = onEvent
+        self.onComplete = onComplete
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        statusCode = (response as? HTTPURLResponse)?.statusCode
+        if let statusCode, (200..<300).contains(statusCode) {
+            completionHandler(.allow)
+        } else {
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+        let separator = Data([0x0A, 0x0A])
+        while let range = buffer.range(of: separator) {
+            let frameData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
+            buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            guard let frame = String(data: frameData, encoding: .utf8) else { continue }
+
+            var eventName: String?
+            var dataLines: [String] = []
+            for rawLine in frame.split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = rawLine.last == "\r" ? rawLine.dropLast() : rawLine[...]
+                if line.hasPrefix("event: ") {
+                    eventName = String(line.dropFirst(7))
+                } else if line.hasPrefix("data: ") {
+                    dataLines.append(String(line.dropFirst(6)))
+                }
+            }
+            if !dataLines.isEmpty {
+                onEvent(eventName, dataLines.joined(separator: "\n"))
+            }
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        onComplete(statusCode, error)
     }
 }
 
